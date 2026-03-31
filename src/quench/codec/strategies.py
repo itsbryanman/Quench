@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from quench.backends.registry import get_entropy_backend, get_packing_backend
+from quench.codec.metadata import serialize_metadata
 from quench.core.config import (
     CalibrationPolicyKind,
     QuantizationGranularity,
@@ -65,6 +66,10 @@ class BaseCompressionStrategy(ABC):
     """Common helpers shared by the concrete codec strategies."""
 
     strategy_name: str
+    _COMPACT_LOSSLESS_FLAG = "l"
+    _COMPACT_KIND_KEY = "k"
+    _HEADER_DTYPE_KEY = "_d"
+    _HEADER_SHAPE_KEY = "_s"
 
     def __init__(self) -> None:
         self._normalizer = ChannelNormalizer()
@@ -96,16 +101,47 @@ class BaseCompressionStrategy(ABC):
         tensor: np.ndarray[Any, np.dtype[Any]],
         config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
-        """Encode original tensor bytes exactly for the lossless mode."""
-        raw_bytes = np.ascontiguousarray(tensor).view(np.uint8)
+        """Encode exact tensors using the smallest available exact representation.
+
+        Compact exact metadata uses short keys intentionally because these paths
+        target tensors where JSON framing cost is material.
+        """
+        values = np.asarray(tensor)
+        candidates: list[tuple[bytes, dict[str, Any]]] = []
+
+        structured_candidate = self._encode_structured_exact(values)
+        if structured_candidate is not None:
+            candidates.append(structured_candidate)
+
+        raw_payload = np.ascontiguousarray(values).tobytes()
+        candidates.append(
+            (
+                raw_payload,
+                {
+                    self._COMPACT_LOSSLESS_FLAG: 1,
+                    self._COMPACT_KIND_KEY: "raw",
+                },
+            )
+        )
+
+        raw_bytes = np.ascontiguousarray(values).view(np.uint8)
         payload, stream_metadata = self._encode_symbol_stream(raw_bytes, config=config)
-        return payload, {
-            "dtype": np.dtype(tensor.dtype).str,
-            "lossless": True,
-            "path": "lossless",
-            "shape": list(tensor.shape),
-            "stream": stream_metadata,
-        }
+        candidates.append(
+            (
+                payload,
+                {
+                    "dtype": np.dtype(values.dtype).str,
+                    "lossless": True,
+                    "path": "lossless",
+                    "shape": list(values.shape),
+                    "stream": stream_metadata,
+                },
+            )
+        )
+        return min(
+            candidates,
+            key=lambda candidate: len(candidate[0]) + len(serialize_metadata(candidate[1])),
+        )
 
     def _decode_lossless(
         self,
@@ -113,13 +149,193 @@ class BaseCompressionStrategy(ABC):
         metadata: dict[str, Any],
         config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[np.uint8]]:
-        """Decode a lossless byte stream."""
+        """Decode a compact or legacy lossless byte stream."""
+        kind = str(metadata.get(self._COMPACT_KIND_KEY, metadata.get("path", "")))
+        dtype, shape = self._metadata_dtype_shape(metadata)
+
+        if kind == "raw":
+            expected_size = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+            if len(data) != expected_size:
+                raise MalformedPayloadError(
+                    "Raw exact payload size mismatch: "
+                    f"expected {expected_size}, got {len(data)}"
+                )
+            return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+
+        if kind == "const":
+            if len(data) != dtype.itemsize:
+                raise MalformedPayloadError(
+                    "Constant exact payload must contain exactly one scalar: "
+                    f"expected {dtype.itemsize} bytes, got {len(data)}"
+                )
+            scalar = np.frombuffer(data, dtype=dtype, count=1)[0]
+            return np.full(shape, scalar, dtype=dtype)
+
+        if kind == "aseq":
+            return self._decode_arithmetic_sequence(metadata, dtype=dtype, shape=shape)
+
+        if kind == "bseq":
+            return self._decode_broadcast_sequence(metadata, dtype=dtype, shape=shape)
+
         stream_metadata = self._require_mapping(metadata, "stream")
         decoded = self._decode_symbol_stream(data, stream_metadata, config=config)
-        dtype = np.dtype(str(metadata.get("dtype", "")))
-        shape = tuple(int(dim) for dim in metadata.get("shape", []))
         raw = np.ascontiguousarray(decoded.astype(np.uint8, copy=False))
         return np.frombuffer(raw.tobytes(), dtype=dtype).reshape(shape).copy()
+
+    def _encode_structured_exact(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """Encode simple exact tensors structurally when possible."""
+        values = np.asarray(tensor)
+        if values.size == 0:
+            return None
+
+        if np.unique(values).size == 1:
+            scalar = np.ascontiguousarray(values.reshape(-1)[:1])
+            return (
+                scalar.tobytes(),
+                {
+                    self._COMPACT_LOSSLESS_FLAG: 1,
+                    self._COMPACT_KIND_KEY: "const",
+                },
+            )
+
+        flat_sequence = self._detect_flat_arithmetic_sequence(values)
+        if flat_sequence is not None:
+            start, step = flat_sequence
+            return (
+                b"",
+                {
+                    self._COMPACT_LOSSLESS_FLAG: 1,
+                    self._COMPACT_KIND_KEY: "aseq",
+                    "p": int(step),
+                    "v": int(start),
+                },
+            )
+
+        broadcast_sequence = self._detect_broadcast_arithmetic_sequence(values)
+        if broadcast_sequence is not None:
+            axis, start, step = broadcast_sequence
+            return (
+                b"",
+                {
+                    self._COMPACT_LOSSLESS_FLAG: 1,
+                    self._COMPACT_KIND_KEY: "bseq",
+                    "a": int(axis),
+                    "p": int(step),
+                    "v": int(start),
+                },
+            )
+        return None
+
+    def _metadata_dtype_shape(
+        self,
+        metadata: dict[str, Any],
+    ) -> tuple[np.dtype[Any], tuple[int, ...]]:
+        """Resolve dtype/shape from strategy metadata or decoder-injected header hints."""
+        dtype_token = metadata.get("d", metadata.get("dtype", metadata.get(self._HEADER_DTYPE_KEY, "")))
+        shape_token = metadata.get("s", metadata.get("shape", metadata.get(self._HEADER_SHAPE_KEY, [])))
+        dtype = np.dtype(str(dtype_token))
+        shape = tuple(int(dim) for dim in shape_token)
+        return dtype, shape
+
+    def _is_lossless_metadata(self, metadata: dict[str, Any]) -> bool:
+        """Support both legacy and compact lossless metadata markers."""
+        if metadata.get("lossless") is True:
+            return True
+        return int(metadata.get(self._COMPACT_LOSSLESS_FLAG, 0)) == 1
+
+    def _decode_arithmetic_sequence(
+        self,
+        metadata: dict[str, Any],
+        *,
+        dtype: np.dtype[Any],
+        shape: tuple[int, ...],
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Decode a flat arithmetic progression."""
+        size = int(np.prod(shape, dtype=np.int64))
+        start = int(metadata["v"])
+        step = int(metadata["p"])
+        values = start + step * np.arange(size, dtype=np.int64)
+        return values.astype(dtype, copy=False).reshape(shape)
+
+    def _decode_broadcast_sequence(
+        self,
+        metadata: dict[str, Any],
+        *,
+        dtype: np.dtype[Any],
+        shape: tuple[int, ...],
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Decode a sequence broadcast along one axis."""
+        if not shape:
+            raise MalformedPayloadError("Broadcast sequence metadata requires at least one dimension")
+        axis = int(metadata["a"])
+        if axis < 0 or axis >= len(shape):
+            raise MalformedPayloadError(
+                f"Broadcast sequence axis {axis} is out of range for shape {shape}"
+            )
+        start = int(metadata["v"])
+        step = int(metadata["p"])
+        length = int(shape[axis])
+        sequence = (start + step * np.arange(length, dtype=np.int64)).astype(dtype, copy=False)
+        view_shape = [1] * len(shape)
+        view_shape[axis] = length
+        return np.broadcast_to(sequence.reshape(view_shape), shape).copy()
+
+    def _detect_flat_arithmetic_sequence(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> tuple[int, int] | None:
+        """Detect integer tensors that are exactly arithmetic when flattened."""
+        values = np.asarray(tensor)
+        if not self._supports_structured_integer_path(values):
+            return None
+
+        flat = values.reshape(-1)
+        if flat.size < 2:
+            return None
+        start = int(flat[0])
+        step = int(flat[1]) - start
+        for index, item in enumerate(flat):
+            if int(item) != start + step * index:
+                return None
+        return start, step
+
+    def _detect_broadcast_arithmetic_sequence(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> tuple[int, int, int] | None:
+        """Detect repeated rows/columns that broadcast one arithmetic sequence."""
+        values = np.asarray(tensor)
+        if values.ndim < 2 or not self._supports_structured_integer_path(values):
+            return None
+
+        for axis in range(values.ndim):
+            moved = np.moveaxis(values, axis, -1)
+            rows = moved.reshape(-1, moved.shape[-1])
+            if rows.shape[0] <= 1:
+                continue
+            base = rows[0]
+            detected = self._detect_flat_arithmetic_sequence(base)
+            if detected is None:
+                continue
+            if np.array_equal(rows, np.broadcast_to(base, rows.shape)):
+                start, step = detected
+                return axis, start, step
+        return None
+
+    @staticmethod
+    def _supports_structured_integer_path(
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> bool:
+        """Keep deterministic integer structure detection narrow and exact."""
+        values = np.asarray(tensor)
+        return (
+            values.size <= 16_384
+            and np.issubdtype(values.dtype, np.integer)
+            and not np.issubdtype(values.dtype, np.bool_)
+        )
 
     def _normalize_tensor(
         self,
@@ -515,7 +731,7 @@ class WeightStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         stream_metadata = self._require_mapping(metadata, "stream")
@@ -575,7 +791,7 @@ class KVCacheStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         quantized = self._decode_symbol_stream(
@@ -649,7 +865,7 @@ class EmbeddingStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
         if metadata.get("path") == "sparse":
             return self._decode_sparse(data, metadata, config)
@@ -798,7 +1014,7 @@ class ActivationStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
         if metadata.get("path") == "sparse":
             return self._decode_sparse(data, metadata, config)
@@ -953,7 +1169,7 @@ class OptimizerStateStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         quantized = self._decode_symbol_stream(
@@ -1025,7 +1241,7 @@ class BiasStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         quantized = self._decode_symbol_stream(
@@ -1076,7 +1292,6 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
         )
         return payload, {
             "lossless": False,
-            "original_dtype": values.dtype.str,
             "path": "mixed_precision",
             "quantization": quant_metadata,
             "stream": stream_metadata,
@@ -1088,7 +1303,7 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         quantized = self._decode_symbol_stream(
@@ -1097,12 +1312,12 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
             config=config,
         )
         restored = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
-        dtype_str = str(metadata.get("original_dtype", restored.dtype.str))
+        dtype_str = str(metadata.get("d", metadata.get("original_dtype", metadata.get(self._HEADER_DTYPE_KEY, restored.dtype.str))))
         return restored.astype(np.dtype(dtype_str), copy=False)
 
 
 class MaskStrategy(BaseCompressionStrategy):
-    """Lossless strategy for binary/constant masks using bitpacking + entropy coding."""
+    """Lossless strategy for structural masks and compact exact binary fallbacks."""
 
     tensor_type = TensorType.MASK
     strategy_id = 8
@@ -1113,46 +1328,37 @@ class MaskStrategy(BaseCompressionStrategy):
         tensor: np.ndarray[Any, np.dtype[Any]],
         config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
-        values = np.asarray(tensor, dtype=np.float32)
-        flat = values.ravel()
+        values = np.asarray(tensor)
+        flat = values.reshape(-1)
         unique = np.unique(flat)
 
-        # Constant tensor: store just the value
         if unique.size == 1:
-            value = float(unique[0])
-            payload = struct.pack("<f", value)
-            return payload, {
-                "lossless": True,
-                "path": "constant",
-                "dtype": np.dtype(tensor.dtype).str,
-                "shape": list(tensor.shape),
-                "value": self._serialize_mask_value(value),
+            return b"", {
+                self._COMPACT_LOSSLESS_FLAG: 1,
+                self._COMPACT_KIND_KEY: "mconst",
+                "v": self._serialize_mask_value(float(unique[0])),
             }
 
-        palette = {float(v): i for i, v in enumerate(unique)}
-        indices = np.array([palette[float(v)] for v in flat], dtype=np.uint8)
+        triangular = self._detect_triangular_mask(values)
+        if triangular is not None:
+            kind, inside, outside = triangular
+            return b"", {
+                self._COMPACT_LOSSLESS_FLAG: 1,
+                self._COMPACT_KIND_KEY: "mtri",
+                "i": self._serialize_mask_value(inside),
+                "o": self._serialize_mask_value(outside),
+                "t": kind,
+            }
 
-        if unique.size == 2:
-            packed = np.packbits(indices, bitorder="little")
-            bits_per_element = 1
-        elif unique.size <= 4:
-            packed = self._pack_2bit(indices)
-            bits_per_element = 2
-        else:
-            packed = indices
-            bits_per_element = 8
+        binary = self._encode_binary_mask(values)
+        if binary is not None:
+            return binary
 
-        payload, stream_metadata = self._encode_symbol_stream(packed, config=config)
-        return payload, {
-            "lossless": True,
-            "path": "bitpack",
-            "dtype": np.dtype(tensor.dtype).str,
-            "shape": list(tensor.shape),
-            "palette": [self._serialize_mask_value(float(v)) for v in unique],
-            "bits_per_element": bits_per_element,
-            "num_elements": int(flat.size),
-            "stream": stream_metadata,
-        }
+        palette = self._encode_palette_mask(values, unique, config=config)
+        if palette is not None:
+            return palette
+
+        return self._encode_lossless(values, config)
 
     def decode(
         self,
@@ -1160,9 +1366,39 @@ class MaskStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        dtype = np.dtype(str(metadata.get("dtype", "<f4")))
-        shape = tuple(int(dim) for dim in metadata.get("shape", []))
-        path = str(metadata.get("path", ""))
+        dtype, shape = self._metadata_dtype_shape(metadata)
+        path = str(metadata.get(self._COMPACT_KIND_KEY, metadata.get("path", "")))
+        size = int(np.prod(shape, dtype=np.int64))
+
+        if path == "mconst":
+            value = self._deserialize_mask_value(metadata["v"])
+            return np.full(shape, value, dtype=dtype)
+
+        if path == "mtri":
+            return self._decode_triangular_mask(metadata, dtype=dtype, shape=shape)
+
+        if path == "mbits":
+            palette = [self._deserialize_mask_value(value) for value in metadata["v"]]
+            bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8), bitorder="little")[:size]
+            palette_arr = np.asarray(palette, dtype=dtype)
+            return palette_arr[bits].reshape(shape)
+
+        if path == "mrle":
+            palette = [self._deserialize_mask_value(value) for value in metadata["v"]]
+            bits = self._decode_binary_runs(data, size)
+            palette_arr = np.asarray(palette, dtype=dtype)
+            return palette_arr[bits].reshape(shape)
+
+        if path == "mpal":
+            palette = [self._deserialize_mask_value(value) for value in metadata["v"]]
+            bits_per_element = int(metadata["b"])
+            packed = np.frombuffer(data, dtype=np.uint8)
+            if bits_per_element == 2:
+                indices = self._unpack_2bit(packed, size)
+            else:
+                indices = packed[:size]
+            palette_arr = np.asarray(palette, dtype=dtype)
+            return palette_arr[indices].reshape(shape)
 
         if path == "constant":
             value = self._deserialize_mask_value(metadata["value"])
@@ -1195,6 +1431,213 @@ class MaskStrategy(BaseCompressionStrategy):
 
         # Fallback for lossless raw encoding
         return self._decode_lossless(data, metadata, config)
+
+    def _detect_triangular_mask(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> tuple[str, float, float] | None:
+        """Detect repeated lower/upper triangular mask blocks exactly."""
+        values = np.asarray(tensor)
+        if values.ndim < 2 or values.shape[-1] != values.shape[-2]:
+            return None
+
+        size = int(values.shape[-1])
+        if size <= 1:
+            return None
+
+        matrices = values.reshape(-1, size, size)
+        base = matrices[0]
+        if not np.array_equal(matrices, np.broadcast_to(base, matrices.shape)):
+            return None
+
+        lower_mask = np.tri(size, size, dtype=bool)
+        upper_mask = np.triu(np.ones((size, size), dtype=bool))
+
+        lower_values = base[lower_mask]
+        upper_values = base[~lower_mask]
+        if upper_values.size and np.all(lower_values == lower_values[0]) and np.all(upper_values == upper_values[0]):
+            return "lower", float(lower_values[0]), float(upper_values[0])
+
+        upper_values = base[upper_mask]
+        lower_values = base[~upper_mask]
+        if lower_values.size and np.all(upper_values == upper_values[0]) and np.all(lower_values == lower_values[0]):
+            return "upper", float(upper_values[0]), float(lower_values[0])
+        return None
+
+    def _decode_triangular_mask(
+        self,
+        metadata: dict[str, Any],
+        *,
+        dtype: np.dtype[Any],
+        shape: tuple[int, ...],
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Reconstruct a triangular mask from structural metadata only."""
+        if len(shape) < 2 or shape[-1] != shape[-2]:
+            raise MalformedPayloadError(
+                f"Triangular mask metadata requires square trailing dims, got {shape}"
+            )
+        size = int(shape[-1])
+        inside = self._deserialize_mask_value(metadata["i"])
+        outside = self._deserialize_mask_value(metadata["o"])
+        kind = str(metadata["t"])
+
+        matrix = np.full((size, size), outside, dtype=dtype)
+        if kind == "lower":
+            matrix[np.tri(size, size, dtype=bool)] = inside
+        elif kind == "upper":
+            matrix[np.triu(np.ones((size, size), dtype=bool))] = inside
+        else:
+            raise MalformedPayloadError(f"Unsupported triangular mask kind: {kind!r}")
+
+        leading = shape[:-2]
+        if not leading:
+            return matrix
+        broadcast_shape = leading + (size, size)
+        return np.broadcast_to(matrix, broadcast_shape).copy()
+
+    def _encode_binary_mask(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """Encode non-structural two-value masks using the smaller exact binary layout."""
+        flat = np.asarray(tensor).reshape(-1)
+        unique = np.unique(flat)
+        if unique.size != 2:
+            return None
+
+        false_value = float(unique[0])
+        true_value = float(unique[1])
+        bits = np.equal(flat, unique[1]).astype(np.uint8, copy=False)
+        packed = np.packbits(bits, bitorder="little").tobytes()
+        packed_metadata = {
+            self._COMPACT_LOSSLESS_FLAG: 1,
+            self._COMPACT_KIND_KEY: "mbits",
+            "v": [
+                self._serialize_mask_value(false_value),
+                self._serialize_mask_value(true_value),
+            ],
+        }
+
+        rle_payload = self._encode_binary_runs(bits)
+        rle_metadata = {
+            self._COMPACT_LOSSLESS_FLAG: 1,
+            self._COMPACT_KIND_KEY: "mrle",
+            "v": [
+                self._serialize_mask_value(false_value),
+                self._serialize_mask_value(true_value),
+            ],
+        }
+
+        packed_size = len(packed) + len(serialize_metadata(packed_metadata))
+        rle_size = len(rle_payload) + len(serialize_metadata(rle_metadata))
+        if rle_size < packed_size:
+            return rle_payload, rle_metadata
+        return packed, packed_metadata
+
+    def _encode_palette_mask(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        unique: np.ndarray[Any, np.dtype[Any]],
+        *,
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """Pack small exact palettes directly instead of falling through to raw bytes."""
+        if unique.size > 4:
+            return None
+
+        flat = np.asarray(tensor).reshape(-1)
+        palette = {float(value): index for index, value in enumerate(unique)}
+        indices = np.fromiter((palette[float(value)] for value in flat), dtype=np.uint8, count=flat.size)
+        packed = self._pack_2bit(indices).tobytes()
+        packed_metadata = {
+            self._COMPACT_LOSSLESS_FLAG: 1,
+            self._COMPACT_KIND_KEY: "mpal",
+            "b": 2,
+            "v": [self._serialize_mask_value(float(value)) for value in unique],
+        }
+        raw_payload, raw_metadata = self._encode_lossless(np.asarray(tensor), config)
+        packed_size = len(packed) + len(serialize_metadata(packed_metadata))
+        raw_size = len(raw_payload) + len(serialize_metadata(raw_metadata))
+        if packed_size < raw_size:
+            return packed, packed_metadata
+        return raw_payload, raw_metadata
+
+    @staticmethod
+    def _encode_binary_runs(bits: np.ndarray[Any, np.dtype[np.uint8]]) -> bytes:
+        """Encode alternating binary runs using a one-byte starting symbol and varints."""
+        if bits.size == 0:
+            return b"\x00"
+
+        payload = bytearray([int(bits[0]) & 0x01])
+        run_length = 1
+        current = int(bits[0])
+        for item in bits[1:]:
+            bit = int(item)
+            if bit == current:
+                run_length += 1
+                continue
+            payload.extend(MaskStrategy._encode_varint(run_length))
+            current = bit
+            run_length = 1
+        payload.extend(MaskStrategy._encode_varint(run_length))
+        return bytes(payload)
+
+    @staticmethod
+    def _decode_binary_runs(data: bytes, size: int) -> np.ndarray[Any, np.dtype[np.uint8]]:
+        """Decode alternating binary runs emitted by :meth:`_encode_binary_runs`."""
+        if not data:
+            raise MalformedPayloadError("Binary RLE payload is empty")
+
+        values = np.empty(size, dtype=np.uint8)
+        bit = int(data[0]) & 0x01
+        offset = 1
+        position = 0
+        while position < size and offset < len(data):
+            run, offset = MaskStrategy._decode_varint(data, offset)
+            end = min(position + run, size)
+            values[position:end] = bit
+            position = end
+            bit ^= 0x01
+        if position != size:
+            raise MalformedPayloadError(
+                f"Binary RLE payload decoded {position} elements, expected {size}"
+            )
+        if offset != len(data):
+            raise MalformedPayloadError("Binary RLE payload has trailing bytes")
+        return values
+
+    @staticmethod
+    def _encode_varint(value: int) -> bytes:
+        """Encode a non-negative integer as unsigned LEB128."""
+        if value < 0:
+            raise ValueError("varint requires a non-negative integer")
+        payload = bytearray()
+        remaining = int(value)
+        while True:
+            byte = remaining & 0x7F
+            remaining >>= 7
+            if remaining:
+                payload.append(byte | 0x80)
+                continue
+            payload.append(byte)
+            return bytes(payload)
+
+    @staticmethod
+    def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+        """Decode one unsigned LEB128 integer."""
+        shift = 0
+        value = 0
+        cursor = offset
+        while cursor < len(data):
+            byte = data[cursor]
+            cursor += 1
+            value |= (byte & 0x7F) << shift
+            if (byte & 0x80) == 0:
+                return value, cursor
+            shift += 7
+            if shift > 63:
+                break
+        raise MalformedPayloadError("Malformed varint in mask payload")
 
     @staticmethod
     def _pack_2bit(
@@ -1311,7 +1754,7 @@ class DefaultStrategy(BaseCompressionStrategy):
         metadata: dict[str, Any],
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        if metadata.get("lossless") is True:
+        if self._is_lossless_metadata(metadata):
             return self._decode_lossless(data, metadata, config)
 
         quantized = self._decode_symbol_stream(

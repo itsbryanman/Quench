@@ -5,7 +5,8 @@ import hashlib
 import json
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterable
@@ -18,6 +19,9 @@ from quench.codec import QuenchDecoder, QuenchEncoder
 from quench.codec.metadata import deserialize_metadata
 from quench.core.config import QuenchConfig
 from quench.core.types import CompressedTensor, TensorType
+from quench.integrations import save_compressed
+from quench.io import QNCReader
+from quench.io.tiny_bundle import distribute_shared_bytes
 
 try:  # pragma: no cover - optional dependency
     import zstandard
@@ -85,7 +89,9 @@ class _TensorEntry:
 
 def load_model_manifest(path: str | Path) -> list[LocalModelSpec]:
     """Load locally downloaded model metadata produced by ``tools/download_models.py``."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    manifest_path = Path(path)
+    manifest_root = manifest_path.parent.resolve()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     models: list[LocalModelSpec] = []
     for item in payload.get("models", []):
         source_hashes = {
@@ -93,11 +99,14 @@ def load_model_manifest(path: str | Path) -> list[LocalModelSpec]:
             for file_record in item.get("files", [])
             if str(file_record.get("kind", "")) == "weight"
         }
+        local_path = Path(str(item["local_path"]))
+        if not local_path.is_absolute():
+            local_path = (manifest_root / local_path).resolve()
         models.append(
             LocalModelSpec(
                 model_id=str(item["repo_id"]),
                 model_revision=str(item["resolved_revision"]),
-                local_path=Path(str(item["local_path"])),
+                local_path=local_path,
                 source_hashes=source_hashes,
             )
         )
@@ -173,6 +182,7 @@ def _benchmark_model(
     skipped_reasons: dict[str, int] = {}
     dtypes_observed: set[str] = set()
     failures: list[dict[str, str]] = []
+    benchmarked_entries: list[_TensorEntry] = []
 
     files = sorted({entry.source_file for entry in entries})
     for file_path in files:
@@ -223,7 +233,7 @@ def _benchmark_model(
                         source_file_sha256=source_hash,
                         model_id=spec.model_id,
                         model_revision=spec.model_revision,
-                        model_local_path=str(spec.local_path),
+                        model_local_path="",
                         benchmark_mode=benchmark_mode,
                         sample_policy=sample_policy,
                         was_sampled=(benchmark_mode == "sampled"),
@@ -247,11 +257,19 @@ def _benchmark_model(
                     )
                     continue
                 results.append(result)
+                benchmarked_entries.append(_TensorEntry(source_file=file_path, tensor_name=tensor_name))
+
+    if results:
+        results = _attach_container_metrics(
+            results,
+            benchmarked_entries,
+            config=config,
+        )
 
     summary = ModelBenchmarkSummary(
         model_id=spec.model_id,
         model_revision=spec.model_revision,
-        model_local_path=str(spec.local_path),
+        model_local_path="",
         benchmark_mode=benchmark_mode,
         sample_policy=sample_policy,
         tensors_discovered=len(entries),
@@ -290,6 +308,7 @@ def _benchmark_tensor(
     values = np.asarray(tensor)
     compressed = encoder.encode(values, tensor_type=tensor_type, name=tensor_name)
     restored = decoder.decode(compressed)
+    exact_kind = _exact_kind(compressed)
 
     encode_seconds = _measure_seconds(
         lambda: encoder.encode(values, tensor_type=tensor_type, name=tensor_name),
@@ -339,6 +358,7 @@ def _benchmark_tensor(
         quench_payload_bytes=len(compressed.payload),
         quench_metadata_bytes=len(compressed.metadata),
         quench_header_bytes=_QUENCH_HEADER_BYTES,
+        quench_exact_kind=exact_kind,
         zstd_raw_ratio=(raw_bytes / zstd_raw_bytes if zstd_raw_bytes else None),
         zstd_quantized_ratio=(
             None
@@ -361,11 +381,10 @@ def _build_quantized_baseline(
     baseline_config = config.model_copy(update={"entropy_coder": "raw", "pack_bits": False})
     baseline_encoder = QuenchEncoder(config=baseline_config)
     baseline = baseline_encoder.encode(tensor, tensor_type=tensor_type, name=tensor_name)
-    strategy_metadata = deserialize_metadata(baseline.metadata).get("strategy", {})
-    if not isinstance(strategy_metadata, dict):
+    metadata = _resolve_strategy_metadata(deserialize_metadata(baseline.metadata))
+    if not isinstance(metadata, dict):
         return None
-    metadata = strategy_metadata.get("metadata", {})
-    if not isinstance(metadata, dict) or metadata.get("lossless") is True:
+    if metadata.get("lossless") is True or int(metadata.get("l", 0)) == 1:
         return None
 
     return {
@@ -536,3 +555,77 @@ def _load_tensor_values(
 
 def _increment_reason(bucket: dict[str, int], reason: str) -> None:
     bucket[reason] = bucket.get(reason, 0) + 1
+
+
+def _attach_container_metrics(
+    results: list[BenchmarkResult],
+    benchmarked_entries: list[_TensorEntry],
+    *,
+    config: QuenchConfig,
+) -> list[BenchmarkResult]:
+    ordered_entries = sorted(
+        benchmarked_entries,
+        key=lambda entry: (str(entry.source_file), entry.tensor_name),
+    )
+    tensors: dict[str, np.ndarray[Any, np.dtype[Any]]] = {}
+    for file_path in sorted({entry.source_file for entry in ordered_entries}):
+        names = [entry.tensor_name for entry in ordered_entries if entry.source_file == file_path]
+        with _open_safetensors(file_path) as handle:
+            for tensor_name in names:
+                values, _ = _load_tensor_values(
+                    handle,
+                    file_path=file_path,
+                    tensor_name=tensor_name,
+                )
+                tensors[tensor_name] = values
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_path = Path(tmpdir) / "model.qnc"
+        save_compressed(bundle_path, tensors, config=config)
+        records = list(QNCReader(bundle_path).iter_tensor_records())
+        file_size = bundle_path.stat().st_size
+
+    shared_header = max(file_size - sum(record.storage_nbytes for record in records), 0)
+    header_shares = distribute_shared_bytes(shared_header, len(records))
+    storage_by_name = {
+        record.name: (
+            record.storage_nbytes + header_shares[index],
+            record.storage_payload_nbytes,
+            record.storage_overhead_nbytes + header_shares[index],
+        )
+        for index, record in enumerate(records)
+    }
+
+    updated: list[BenchmarkResult] = []
+    for result in results:
+        container_metrics = storage_by_name.get(result.tensor_name)
+        if container_metrics is None:
+            updated.append(result)
+            continue
+        container_bytes, container_payload, container_overhead = container_metrics
+        updated.append(
+            replace(
+                result,
+                quench_container_bytes=container_bytes,
+                quench_container_payload_bytes=container_payload,
+                quench_container_overhead_bytes=container_overhead,
+            )
+        )
+    return updated
+
+
+def _exact_kind(compressed: CompressedTensor) -> str | None:
+    metadata = _resolve_strategy_metadata(deserialize_metadata(compressed.metadata))
+    kind = metadata.get("k", metadata.get("path"))
+    if kind is None:
+        return None
+    return str(kind)
+
+
+def _resolve_strategy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    strategy = metadata.get("strategy")
+    if isinstance(strategy, dict):
+        nested = strategy.get("metadata")
+        if isinstance(nested, dict):
+            return nested
+    return metadata

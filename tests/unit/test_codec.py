@@ -1,13 +1,15 @@
 """Unit tests for the Phase 3 codec pipeline."""
 from __future__ import annotations
 
+import shutil
+import subprocess
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
 import quench
-from quench.codec import QuenchDecoder, QuenchEncoder
+from quench.codec import QuenchDecoder, QuenchEncoder, deserialize_metadata
 from quench.core import (
     MalformedPayloadError,
     MetadataError,
@@ -15,6 +17,7 @@ from quench.core import (
     UnsupportedStrategyError,
 )
 from quench.core.types import TensorHeader, TensorType
+from quench.io.tiny_bundle import try_build_tiny_exact_bundle_entry
 
 
 def _weight_tensor() -> np.ndarray:
@@ -56,6 +59,34 @@ def _assert_bounded_error(
     error = np.abs(restored.astype(np.float32) - original.astype(np.float32))
     assert float(np.mean(error)) <= mae_limit
     assert float(np.max(error)) <= max_limit
+
+
+def _compress_zstd(data: bytes) -> int | None:
+    """Return the zstd-compressed size when an implementation is available."""
+    try:
+        import zstandard
+    except Exception:
+        if shutil.which("zstd") is None:
+            return None
+        completed = subprocess.run(
+            ["zstd", "-3", "-q", "-c"],
+            input=data,
+            capture_output=True,
+            check=True,
+        )
+        return len(completed.stdout)
+    return len(zstandard.ZstdCompressor(level=3).compress(data))
+
+
+def _strategy_metadata(compressed: quench.CompressedTensor) -> dict[str, object]:
+    """Load strategy metadata from either the legacy or compact metadata schema."""
+    metadata = deserialize_metadata(compressed.metadata)
+    strategy = metadata.get("strategy")
+    if isinstance(strategy, dict):
+        strategy_metadata = strategy.get("metadata")
+        assert isinstance(strategy_metadata, dict)
+        return strategy_metadata
+    return metadata
 
 
 def test_weight_roundtrip_end_to_end() -> None:
@@ -117,24 +148,60 @@ def test_mask_roundtrip_causal() -> None:
     mask = np.tril(np.ones((1024, 1024), dtype=np.float32))
     compressed = quench.compress(mask, tensor_type=TensorType.MASK)
     restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
     np.testing.assert_array_equal(mask, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "mtri"
     assert compressed.compressed_nbytes < mask.nbytes
+    zstd_size = _compress_zstd(np.ascontiguousarray(mask).tobytes())
+    if zstd_size is not None:
+        assert compressed.compressed_nbytes < zstd_size
 
 
 def test_mask_roundtrip_neg_inf() -> None:
     mask = np.where(np.tril(np.ones((512, 512))), 0.0, float('-inf')).astype(np.float32)
     compressed = quench.compress(mask, tensor_type=TensorType.MASK)
     restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
     np.testing.assert_array_equal(mask, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "mtri"
+    zstd_size = _compress_zstd(np.ascontiguousarray(mask).tobytes())
+    if zstd_size is not None:
+        assert compressed.compressed_nbytes < zstd_size
 
 
 def test_constant_tensor_roundtrip() -> None:
     const = np.ones((256, 256), dtype=np.float32)
     compressed = quench.compress(const, tensor_type=TensorType.MASK)
     restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
     np.testing.assert_array_equal(const, restored)
     # Constant tensor payload should be tiny (metadata + header overhead is separate)
-    assert len(compressed.payload) < 100
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "mconst"
+    assert len(compressed.payload) == 0
+    assert compressed.compressed_nbytes < 128
+
+
+def test_all_zero_mask_uses_compact_constant_path() -> None:
+    const = np.zeros((128, 128), dtype=np.float32)
+    compressed = quench.compress(const, tensor_type=TensorType.MASK)
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(const, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "mconst"
+    assert len(compressed.payload) == 0
+
+
+def test_nontrivial_binary_mask_uses_compact_fallback() -> None:
+    row = (np.arange(64) % 3 == 0).astype(np.float32)
+    mask = np.vstack([np.roll(row, shift) for shift in range(64)]).astype(np.float32)
+    compressed = quench.compress(mask, tensor_type=TensorType.MASK)
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(mask, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) in {"mbits", "mrle"}
+    assert compressed.compressed_nbytes < mask.nbytes
 
 
 def test_layernorm_weight_is_lossless() -> None:
@@ -151,6 +218,97 @@ def test_tiny_tensor_is_lossless() -> None:
     compressed = quench.compress(values, name="some.small.param")
     restored = quench.decompress(compressed)
     np.testing.assert_array_equal(values, restored)
+
+
+def test_small_bias_uses_compact_exact_raw_path() -> None:
+    """Small exact biases should stop entropy-coding raw bytes."""
+    rng = np.random.default_rng(303)
+    values = rng.normal(scale=0.02, size=(384,)).astype(np.float32)
+
+    compressed = quench.compress(values, name="proj.bias")
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "raw"
+    assert len(compressed.payload) == values.nbytes
+    zstd_size = _compress_zstd(np.ascontiguousarray(values).tobytes())
+    if zstd_size is not None:
+        assert compressed.compressed_nbytes <= int(zstd_size * 1.25)
+
+
+def test_small_constant_vector_uses_compact_exact_constant_path() -> None:
+    values = np.ones((384,), dtype=np.float32)
+
+    compressed = quench.compress(values, name="layer.bias")
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "const"
+    assert len(compressed.payload) == values.dtype.itemsize
+    assert compressed.compressed_nbytes < 128
+
+
+def test_small_layernorm_weight_uses_compact_exact_path() -> None:
+    rng = np.random.default_rng(404)
+    values = (1.0 + rng.normal(scale=0.001, size=(192,))).astype(np.float32)
+
+    compressed = quench.compress(values, name="encoder.layer.0.output.LayerNorm.weight")
+    restored = quench.decompress(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert len(compressed.payload) <= values.nbytes
+
+
+def test_position_ids_use_structural_sequence_path() -> None:
+    values = np.arange(512, dtype=np.int64).reshape(1, 512)
+
+    compressed = quench.compress(values, name="embeddings.position_ids")
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert compressed.header.tensor_type == TensorType.MIXED_PRECISION
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "aseq"
+    assert len(compressed.payload) == 0
+    zstd_size = _compress_zstd(np.ascontiguousarray(values).tobytes())
+    if zstd_size is not None:
+        assert compressed.compressed_nbytes < zstd_size
+
+
+def test_repeated_position_ids_use_broadcast_sequence_path() -> None:
+    values = np.broadcast_to(np.arange(128, dtype=np.int64), (4, 128)).copy()
+
+    compressed = quench.compress(values, name="position_ids")
+    restored = quench.decompress(compressed)
+    strategy_metadata = _strategy_metadata(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert strategy_metadata.get("k", strategy_metadata.get("path")) == "bseq"
+    assert len(compressed.payload) == 0
+
+
+def test_tiny_int_tensor_roundtrip_exact() -> None:
+    values = np.array([7, -3, 5, 12], dtype=np.int64)
+
+    compressed = quench.compress(values, name="small.ints")
+    restored = quench.decompress(compressed)
+
+    np.testing.assert_array_equal(values, restored)
+    assert len(compressed.payload) <= values.nbytes
+
+
+def test_tiny_exact_bundle_candidate_selection_is_exact_and_size_limited() -> None:
+    sequence = quench.compress(np.arange(128, dtype=np.int64).reshape(1, 128), name="position_ids")
+    large = quench.compress(np.arange(1024, dtype=np.int64).reshape(1, 1024), name="large.position_ids")
+
+    sequence_candidate = try_build_tiny_exact_bundle_entry("position_ids", sequence)
+    large_candidate = try_build_tiny_exact_bundle_entry("large.position_ids", large)
+
+    assert sequence_candidate is not None
+    assert sequence_candidate.kind == "aseq"
+    assert large_candidate is None
 
 
 def test_decode_rejects_malformed_metadata() -> None:

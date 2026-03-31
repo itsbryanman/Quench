@@ -85,3 +85,20 @@ def test_build_aggregates_tracks_cosine_similarity() -> None:
     assert aggregates["by_run"]["mean_cosine_similarity"] == 0.97
     assert aggregates["by_run"]["median_cosine_similarity"] == 0.97
     assert aggregates["by_run"]["p5_cosine_similarity"] == 0.952
+
+
+def test_build_aggregates_prefers_container_bytes_when_present() -> None:
+    result = BenchmarkResult(
+        **{
+            **_result("tensor/container").__dict__,
+            "quench_container_bytes": 96,
+            "quench_container_payload_bytes": 72,
+            "quench_container_overhead_bytes": 24,
+        }
+    )
+
+    aggregates = build_aggregates([result])
+
+    assert aggregates["by_run"]["compressed_bytes_total"] == 96
+    assert aggregates["by_run"]["aggregate_compression_ratio"] == (256 / 96)
+    assert aggregates["by_run"]["mean_metadata_plus_header_bytes"] == 24

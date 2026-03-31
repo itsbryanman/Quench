@@ -58,6 +58,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest) if args.manifest else output_dir / "model-download-manifest.json"
+    manifest_dir = manifest_path.parent.resolve()
     token = os.environ.get("HF_TOKEN") or None
 
     api = HfApi(token=token)
@@ -80,12 +81,17 @@ def main() -> None:
             )
             files = _collect_file_metadata(local_path)
             total_bytes = sum(int(item["size_bytes"]) for item in files)
+            local_path_resolved = local_path.resolve()
+            try:
+                manifest_local_path = str(local_path_resolved.relative_to(manifest_dir))
+            except ValueError:
+                manifest_local_path = os.path.relpath(local_path_resolved, manifest_dir)
             models.append(
                 {
                     "repo_id": repo_id,
                     "requested_revision": requested_revision,
                     "resolved_revision": resolved_revision,
-                    "local_path": str(local_path),
+                    "local_path": manifest_local_path,
                     "total_downloaded_bytes": total_bytes,
                     "files": files,
                 }

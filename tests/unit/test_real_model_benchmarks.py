@@ -20,7 +20,7 @@ def test_load_model_manifest(tmp_path: Path) -> None:
                     {
                         "repo_id": "acme/model",
                         "resolved_revision": "123abc",
-                        "local_path": str(tmp_path / "snapshot"),
+                        "local_path": "snapshot",
                         "files": [
                             {
                                 "path": "model.safetensors",
@@ -84,8 +84,10 @@ def test_run_real_model_suite_on_local_safetensors(tmp_path: Path) -> None:
     assert summary["total_tensors_benchmarked"] == 3
     assert summary["total_tensors_skipped"] == 1
     assert summary["skipped_reasons"] == {"sample_policy_excluded": 1}
+    assert summary["models"][0]["model_local_path"] == ""
     assert summary["models"][0]["dtypes_observed"] == ("float32",)
     assert {item.tensor_role for item in results} == {"attn_q_proj", "embedding", "mlp_down_proj"}
+    assert all(item.model_local_path == "" for item in results)
     assert all(item.source_dtype == "float32" for item in results)
     assert all(item.cosine_similarity is not None for item in results)
 
@@ -121,6 +123,8 @@ def test_run_real_model_suite_falls_back_to_torch_for_bfloat16(tmp_path: Path) -
     )
 
     assert len(results) == 1
+    assert results[0].model_local_path == ""
     assert results[0].source_dtype == "bfloat16"
     assert results[0].dtype == "float32"
+    assert summary["models"][0]["model_local_path"] == ""
     assert summary["models"][0]["dtypes_observed"] == ("bfloat16",)

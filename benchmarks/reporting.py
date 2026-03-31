@@ -10,7 +10,7 @@ from statistics import mean, median
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CSV_FIELDS = [
     "benchmark_name",
     "model_id",
@@ -35,6 +35,11 @@ CSV_FIELDS = [
     "quench_payload_bytes",
     "quench_metadata_bytes",
     "quench_header_bytes",
+    "quench_container_bytes",
+    "quench_container_payload_bytes",
+    "quench_container_overhead_bytes",
+    "quench_exact_kind",
+    "quench_bundle_entries",
     "compression_ratio",
     "zstd_raw_ratio",
     "zstd_quantized_ratio",
@@ -83,6 +88,11 @@ class BenchmarkResult:
     quench_payload_bytes: int | None = None
     quench_metadata_bytes: int | None = None
     quench_header_bytes: int | None = None
+    quench_container_bytes: int | None = None
+    quench_container_payload_bytes: int | None = None
+    quench_container_overhead_bytes: int | None = None
+    quench_exact_kind: str | None = None
+    quench_bundle_entries: int | None = None
     zstd_raw_ratio: float | None = None
     zstd_quantized_ratio: float | None = None
     cosine_similarity: float | None = None
@@ -143,7 +153,7 @@ def load_json_report(path: str | Path) -> list[BenchmarkResult]:
     """Load benchmark results from a JSON artifact."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     schema_version = int(payload["schema_version"])
-    if schema_version not in {1, 2}:
+    if schema_version not in {1, 2, 3}:
         raise ValueError(f"Unsupported benchmark schema version: {payload['schema_version']}")
     valid_fields = {f.name for f in __import__("dataclasses").fields(BenchmarkResult)}
     results = []
@@ -249,7 +259,7 @@ def _aggregate_groups(
 def _aggregate_rows(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
     rows = list(results)
     raw_total = sum(item.raw_bytes for item in rows)
-    compressed_total = sum(item.compressed_bytes for item in rows)
+    compressed_total = sum(_effective_compressed_bytes(item) for item in rows)
     zstd_raw_values = [item.zstd_raw_bytes for item in rows if item.zstd_raw_bytes is not None]
     zstd_quantized_values = [item.zstd_quantized_bytes for item in rows if item.zstd_quantized_bytes is not None]
     cosine_values = [item.cosine_similarity for item in rows if item.cosine_similarity is not None]
@@ -258,27 +268,24 @@ def _aggregate_rows(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
     mse_values = [item.mse for item in rows]
     max_abs_values = [item.max_abs_error for item in rows]
     relative_values = [item.relative_error for item in rows]
-    metadata_overheads = [
-        (item.quench_metadata_bytes or 0) + (item.quench_header_bytes or 0)
-        for item in rows
-    ]
+    metadata_overheads = [_effective_overhead_bytes(item) for item in rows]
     savings_vs_zstd_raw = [
-        item.zstd_raw_bytes - item.compressed_bytes
+        item.zstd_raw_bytes - _effective_compressed_bytes(item)
         for item in rows
         if item.zstd_raw_bytes is not None
     ]
     savings_vs_zstd_quantized = [
-        item.zstd_quantized_bytes - item.compressed_bytes
+        item.zstd_quantized_bytes - _effective_compressed_bytes(item)
         for item in rows
         if item.zstd_quantized_bytes is not None
     ]
     pct_savings_vs_zstd_raw = [
-        (item.zstd_raw_bytes - item.compressed_bytes) / item.zstd_raw_bytes
+        (item.zstd_raw_bytes - _effective_compressed_bytes(item)) / item.zstd_raw_bytes
         for item in rows
         if item.zstd_raw_bytes not in (None, 0)
     ]
     pct_savings_vs_zstd_quantized = [
-        (item.zstd_quantized_bytes - item.compressed_bytes) / item.zstd_quantized_bytes
+        (item.zstd_quantized_bytes - _effective_compressed_bytes(item)) / item.zstd_quantized_bytes
         for item in rows
         if item.zstd_quantized_bytes not in (None, 0)
     ]
@@ -298,8 +305,8 @@ def _aggregate_rows(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
             if zstd_quantized_values and sum(zstd_quantized_values)
             else None
         ),
-        "mean_compression_ratio": mean(item.compression_ratio for item in rows) if rows else 0.0,
-        "median_compression_ratio": median(item.compression_ratio for item in rows) if rows else 0.0,
+        "mean_compression_ratio": mean(_effective_compression_ratio(item) for item in rows) if rows else 0.0,
+        "median_compression_ratio": median(_effective_compression_ratio(item) for item in rows) if rows else 0.0,
         "mean_mse": mean(mse_values) if mse_values else 0.0,
         "median_mse": median(mse_values) if mse_values else 0.0,
         "max_abs_error_max": max(max_abs_values) if max_abs_values else 0.0,
@@ -334,6 +341,21 @@ def _aggregate_rows(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
             median(pct_savings_vs_zstd_quantized) if pct_savings_vs_zstd_quantized else None
         ),
     }
+
+
+def _effective_compressed_bytes(result: BenchmarkResult) -> int:
+    return int(result.quench_container_bytes or result.compressed_bytes)
+
+
+def _effective_overhead_bytes(result: BenchmarkResult) -> int:
+    if result.quench_container_overhead_bytes is not None:
+        return int(result.quench_container_overhead_bytes)
+    return int((result.quench_metadata_bytes or 0) + (result.quench_header_bytes or 0))
+
+
+def _effective_compression_ratio(result: BenchmarkResult) -> float:
+    compressed = _effective_compressed_bytes(result)
+    return result.raw_bytes / compressed if compressed else 0.0
 
 
 def _percentile(values: Sequence[float], percentile: float) -> float:

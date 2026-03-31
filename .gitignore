@@ -41,6 +41,9 @@ htmlcov/
 traces/
 *.qnc
 models/
+benchmarks/artifacts/
+benchmarks/models/
+*.log
 
 # OS
 .DS_Store

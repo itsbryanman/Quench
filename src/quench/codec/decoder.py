@@ -30,23 +30,13 @@ class QuenchDecoder:
         self._validate_compressed(compressed)
         header = compressed.header
         metadata = deserialize_metadata(compressed.metadata)
-        strategy_block = metadata.get("strategy")
-        if not isinstance(strategy_block, dict):
-            raise MalformedPayloadError("Compressed metadata is missing the strategy block")
-
-        strategy_id = int(strategy_block.get("id", header.strategy_id))
-        if strategy_id != header.strategy_id:
-            raise UnsupportedStrategyError(
-                "Strategy id mismatch between header and metadata: "
-                f"header={header.strategy_id}, metadata={strategy_id}"
-            )
-
+        strategy_id, strategy_metadata = self._resolve_strategy_metadata(metadata, header)
         strategy = get_strategy_by_id(strategy_id, header.tensor_type)
-        strategy_metadata = strategy_block.get("metadata")
-        if not isinstance(strategy_metadata, dict):
-            raise MalformedPayloadError("Strategy metadata must be a dictionary")
+        prepared_metadata = dict(strategy_metadata)
+        prepared_metadata.setdefault("_d", np.dtype(header.dtype).str)
+        prepared_metadata.setdefault("_s", [int(dim) for dim in header.shape])
 
-        decoded = strategy.decode(compressed.payload, strategy_metadata, config=self._config)
+        decoded = strategy.decode(compressed.payload, prepared_metadata, config=self._config)
         restored = np.asarray(decoded)
 
         expected_size = int(np.prod(header.shape, dtype=np.int64))
@@ -69,7 +59,7 @@ class QuenchDecoder:
                 f"expected {expected_nbytes}, got {compressed.original_nbytes}"
             )
 
-        if strategy_metadata.get("lossless") is True:
+        if self._is_lossless_metadata(prepared_metadata):
             checksum = int(zlib.crc32(np.ascontiguousarray(restored).view(np.uint8)) & 0xFFFFFFFF)
             if checksum != header.checksum:
                 raise ChecksumMismatchError(
@@ -94,3 +84,31 @@ class QuenchDecoder:
             raise MalformedPayloadError("Compressed tensor metadata must be bytes")
         if compressed.original_nbytes <= 0:
             raise CodecError("Compressed tensor original_nbytes must be positive")
+
+    def _resolve_strategy_metadata(
+        self,
+        metadata: dict[str, Any],
+        header: TensorHeader,
+    ) -> tuple[int, dict[str, Any]]:
+        """Support both legacy wrapped metadata and compact direct strategy metadata."""
+        strategy_block = metadata.get("strategy")
+        if isinstance(strategy_block, dict):
+            strategy_id = int(strategy_block.get("id", header.strategy_id))
+            if strategy_id != header.strategy_id:
+                raise UnsupportedStrategyError(
+                    "Strategy id mismatch between header and metadata: "
+                    f"header={header.strategy_id}, metadata={strategy_id}"
+                )
+            strategy_metadata = strategy_block.get("metadata")
+            if not isinstance(strategy_metadata, dict):
+                raise MalformedPayloadError("Strategy metadata must be a dictionary")
+            return strategy_id, strategy_metadata
+
+        return header.strategy_id, metadata
+
+    @staticmethod
+    def _is_lossless_metadata(metadata: dict[str, Any]) -> bool:
+        """Support compact and legacy lossless metadata flags."""
+        if metadata.get("lossless") is True:
+            return True
+        return int(metadata.get("l", 0)) == 1

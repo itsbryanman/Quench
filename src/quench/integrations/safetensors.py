@@ -14,6 +14,8 @@ from quench.core.config import QuenchConfig
 from quench.core.exceptions import CodecError
 from quench.core.types import CompressedTensor
 from quench.io import QNCReader, QNCWriter
+from quench.io.container import QNC_VERSION_V2, QNC_VERSION_V3
+from quench.io.tiny_bundle import try_build_tiny_exact_bundle_entry
 
 try:  # pragma: no cover - optional dependency
     from safetensors import safe_open as _safe_open
@@ -47,11 +49,23 @@ def save_compressed(
     config: QuenchConfig | None = None,
     *,
     chunk_size: int = 1 << 20,
+    enable_tiny_exact_bundle: bool = True,
 ) -> None:
     """Compress a tensor mapping and write it to a `.qnc` bundle incrementally."""
     encoder = QuenchEncoder(config=config)
     tensor_count = _mapping_length(state_dict)
-    with QNCWriter(path, tensor_count=tensor_count, chunk_size=chunk_size) as writer:
+    use_tiny_exact_bundle = (
+        enable_tiny_exact_bundle
+        and isinstance(state_dict, Mapping)
+        and _mapping_may_contain_tiny_exact_candidates(state_dict)
+    )
+    with QNCWriter(
+        path,
+        tensor_count=tensor_count,
+        chunk_size=chunk_size,
+        version=(QNC_VERSION_V3 if use_tiny_exact_bundle else QNC_VERSION_V2),
+        enable_tiny_exact_bundle=use_tiny_exact_bundle,
+    ) as writer:
         if isinstance(state_dict, Mapping):
             for name, compressed in encoder.iter_encode_dict(dict(state_dict), config=config):
                 writer.write_compressed_tensor(name, compressed, chunk_size=chunk_size)
@@ -79,10 +93,24 @@ def save_compressed_bundle(
     tensors: Mapping[str, CompressedTensor],
     *,
     chunk_size: int = 1 << 20,
+    enable_tiny_exact_bundle: bool = True,
 ) -> None:
     """Write an already-compressed tensor mapping to a `.qnc` bundle."""
-    with QNCWriter(path, tensor_count=len(tensors), chunk_size=chunk_size) as writer:
-        for name in sorted(tensors):
+    ordered_names = sorted(tensors)
+    candidate_count = sum(
+        1
+        for name in ordered_names
+        if try_build_tiny_exact_bundle_entry(name, tensors[name]) is not None
+    )
+    use_tiny_exact_bundle = enable_tiny_exact_bundle and candidate_count >= 2
+    with QNCWriter(
+        path,
+        tensor_count=len(tensors),
+        chunk_size=chunk_size,
+        version=(QNC_VERSION_V3 if use_tiny_exact_bundle else QNC_VERSION_V2),
+        enable_tiny_exact_bundle=use_tiny_exact_bundle,
+    ) as writer:
+        for name in ordered_names:
             writer.write_compressed_tensor(name, tensors[name], chunk_size=chunk_size)
 
 
@@ -195,3 +223,23 @@ def _iter_sorted_items(
             yield name, mapping_or_items[name]
         return
     yield from mapping_or_items
+
+
+def _mapping_may_contain_tiny_exact_candidates(
+    mapping: Mapping[str, TensorLike],
+) -> bool:
+    candidate_count = 0
+    for name in sorted(mapping):
+        values = np.asarray(mapping[name])
+        raw_nbytes = int(values.nbytes)
+        if raw_nbytes <= 2048:
+            candidate_count += 1
+        else:
+            lower = name.lower()
+            if raw_nbytes <= 4096 and any(
+                token in lower for token in ("bias", "norm", "position_ids", "token_type_ids", "type_ids")
+            ):
+                candidate_count += 1
+        if candidate_count >= 2:
+            return True
+    return False

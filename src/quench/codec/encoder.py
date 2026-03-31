@@ -98,21 +98,11 @@ class QuenchEncoder:
         strategy = get_strategy(detected_type)
         payload, strategy_metadata = strategy.encode(values, effective_config)
         effective_codec_mode = (
-            CodecMode.LOSSLESS if strategy_metadata.get("lossless") is True else effective_config.codec_mode
+            CodecMode.LOSSLESS
+            if self._is_lossless_strategy_metadata(strategy_metadata)
+            else effective_config.codec_mode
         )
-
-        metadata = {
-            "name": name,
-            "original_dtype": np.dtype(values.dtype).str,
-            "profiled_tensor_type": int(detected_type),
-            "shape": list(values.shape),
-            "strategy": {
-                "id": strategy.strategy_id,
-                "name": strategy.strategy_name,
-                "metadata": strategy_metadata,
-            },
-        }
-        metadata_bytes = serialize_metadata(metadata)
+        metadata_bytes = serialize_metadata(strategy_metadata)
         checksum = self._checksum(values)
 
         header = TensorHeader(
@@ -181,6 +171,13 @@ class QuenchEncoder:
         """Compute a stable checksum from the original tensor bytes."""
         raw = np.ascontiguousarray(tensor).view(np.uint8)
         return int(zlib.crc32(raw) & 0xFFFFFFFF)
+
+    @staticmethod
+    def _is_lossless_strategy_metadata(metadata: dict[str, Any]) -> bool:
+        """Support compact and legacy exact-path metadata markers."""
+        if metadata.get("lossless") is True:
+            return True
+        return int(metadata.get("l", 0)) == 1
 
     def _resolve_bit_allocation(
         self,
