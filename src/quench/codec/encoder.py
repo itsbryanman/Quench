@@ -148,7 +148,7 @@ class QuenchEncoder:
         name: str | None,
     ) -> bool:
         """Force exact routing for tiny tensors and norm parameters."""
-        if int(np.asarray(tensor).nbytes) <= 1024:
+        if int(np.asarray(tensor).nbytes) <= 2048:
             return True
         return self._looks_like_norm_tensor_name(name)
 

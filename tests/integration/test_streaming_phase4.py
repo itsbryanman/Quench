@@ -53,7 +53,8 @@ def test_python_backend_pluggable_encode_decode_path(tmp_path: Path) -> None:
     metadata = deserialize_metadata(compressed.metadata)
     restored = decoder.decode(compressed)
 
-    assert metadata["strategy"]["metadata"]["stream"]["encoding"] == "packed"
+    # 512 float32 values are exactly 2048 bytes, so the encoder now forces lossless routing.
+    assert metadata["strategy"]["metadata"]["stream"]["encoding"] == "raw"
     np.testing.assert_allclose(restored, tensor, atol=0.2)
 
 

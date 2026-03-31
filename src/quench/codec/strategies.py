@@ -179,6 +179,11 @@ class BaseCompressionStrategy(ABC):
     ) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]]:
         """Quantize values using reusable quantizer/calibration components."""
         values = np.asarray(tensor)
+
+        # Boost precision for small tensors that cannot amortize quantization noise.
+        if values.size < 2048 and bits < 8:
+            bits = min(bits + 2, 8)
+
         layout = self._resolve_layout(
             config,
             tensor_ndim=values.ndim,
@@ -990,9 +995,13 @@ class BiasStrategy(BaseCompressionStrategy):
         ):
             return self._encode_lossless(values, config)
 
+        if values.nbytes <= 4096:
+            return self._encode_lossless(values, config)
+
+        bits = min(config.target_bits + 2, 8)
         quantized, quant_metadata = self._quantize_tensor(
             values.astype(np.float32, copy=False),
-            bits=config.target_bits,
+            bits=bits,
             mode=self._activation_quant_mode(values, config.quant_mode),
             config=config,
             default_axis=0,
@@ -1001,7 +1010,7 @@ class BiasStrategy(BaseCompressionStrategy):
         payload, stream_metadata = self._encode_symbol_stream(
             quantized,
             config=config,
-            bits=config.target_bits,
+            bits=bits,
         )
         return payload, {
             "lossless": False,
@@ -1047,6 +1056,9 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
         ):
             return self._encode_lossless(values, config)
 
+        if values.nbytes <= 4096:
+            return self._encode_lossless(values, config)
+
         working = values.astype(np.float32, copy=False)
         quant_mode = self._activation_quant_mode(working, config.quant_mode)
         quantized, quant_metadata = self._quantize_tensor(
@@ -1090,7 +1102,7 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
 
 
 class MaskStrategy(BaseCompressionStrategy):
-    """Lossless strategy for binary/constant masks using RLE encoding."""
+    """Lossless strategy for binary/constant masks using bitpacking + entropy coding."""
 
     tensor_type = TensorType.MASK
     strategy_id = 8
@@ -1107,22 +1119,39 @@ class MaskStrategy(BaseCompressionStrategy):
 
         # Constant tensor: store just the value
         if unique.size == 1:
-            payload = struct.pack("<f", float(unique[0]))
+            value = float(unique[0])
+            payload = struct.pack("<f", value)
             return payload, {
                 "lossless": True,
                 "path": "constant",
                 "dtype": np.dtype(tensor.dtype).str,
                 "shape": list(tensor.shape),
-                "value": float(unique[0]),
+                "value": self._serialize_mask_value(value),
             }
 
-        # RLE encoding
-        payload = self._rle_encode(flat)
+        palette = {float(v): i for i, v in enumerate(unique)}
+        indices = np.array([palette[float(v)] for v in flat], dtype=np.uint8)
+
+        if unique.size == 2:
+            packed = np.packbits(indices, bitorder="little")
+            bits_per_element = 1
+        elif unique.size <= 4:
+            packed = self._pack_2bit(indices)
+            bits_per_element = 2
+        else:
+            packed = indices
+            bits_per_element = 8
+
+        payload, stream_metadata = self._encode_symbol_stream(packed, config=config)
         return payload, {
             "lossless": True,
-            "path": "rle",
+            "path": "bitpack",
             "dtype": np.dtype(tensor.dtype).str,
             "shape": list(tensor.shape),
+            "palette": [self._serialize_mask_value(float(v)) for v in unique],
+            "bits_per_element": bits_per_element,
+            "num_elements": int(flat.size),
+            "stream": stream_metadata,
         }
 
     def decode(
@@ -1136,37 +1165,71 @@ class MaskStrategy(BaseCompressionStrategy):
         path = str(metadata.get("path", ""))
 
         if path == "constant":
-            value = float(metadata["value"])
+            value = self._deserialize_mask_value(metadata["value"])
             return np.full(shape, value, dtype=dtype)
+
+        if path == "bitpack":
+            stream_metadata = self._require_mapping(metadata, "stream")
+            packed = self._decode_symbol_stream(data, stream_metadata, config=config)
+            packed_u8 = packed.astype(np.uint8, copy=False)
+
+            palette = [self._deserialize_mask_value(v) for v in metadata["palette"]]
+            bits_per_element = int(metadata["bits_per_element"])
+            num_elements = int(metadata["num_elements"])
+
+            if bits_per_element == 1:
+                indices = np.unpackbits(packed_u8, bitorder="little")[:num_elements]
+            elif bits_per_element == 2:
+                indices = self._unpack_2bit(packed_u8, num_elements)
+            else:
+                indices = packed_u8[:num_elements]
+
+            palette_arr = np.array(palette, dtype=np.float32)
+            flat = palette_arr[indices]
+            return flat.astype(dtype, copy=False).reshape(shape)
 
         if path == "rle":
             size = int(np.prod(shape, dtype=np.int64))
-            flat = self._rle_decode(data, size)
+            flat = self._rle_decode_legacy(data, size)
             return flat.astype(dtype, copy=False).reshape(shape)
 
         # Fallback for lossless raw encoding
         return self._decode_lossless(data, metadata, config)
 
     @staticmethod
-    def _rle_encode(flat: np.ndarray[Any, np.dtype[np.float32]]) -> bytes:
-        """Run-length encode a flat float32 array."""
-        parts: list[bytes] = []
-        n = flat.size
-        i = 0
-        while i < n:
-            val = float(flat[i])
-            run = 1
-            while i + run < n and float(flat[i + run]) == val:
-                run += 1
-                if run == 0xFFFFFFFF:
-                    break
-            parts.append(struct.pack("<fI", val, run))
-            i += run
-        return b"".join(parts)
+    def _pack_2bit(
+        indices: np.ndarray[Any, np.dtype[np.uint8]],
+    ) -> np.ndarray[Any, np.dtype[np.uint8]]:
+        """Pack values 0-3 into 2-bit-per-element bytes in little-endian order."""
+        n = indices.size
+        padded_size = (n + 3) // 4 * 4
+        padded = np.zeros(padded_size, dtype=np.uint8)
+        padded[:n] = indices
+        reshaped = padded.reshape(-1, 4)
+        packed = (
+            reshaped[:, 0]
+            | (reshaped[:, 1] << 2)
+            | (reshaped[:, 2] << 4)
+            | (reshaped[:, 3] << 6)
+        )
+        return packed.astype(np.uint8)
 
     @staticmethod
-    def _rle_decode(data: bytes, size: int) -> np.ndarray[Any, np.dtype[np.float32]]:
-        """Decode an RLE-encoded byte stream into a flat float32 array."""
+    def _unpack_2bit(
+        packed: np.ndarray[Any, np.dtype[np.uint8]],
+        num_elements: int,
+    ) -> np.ndarray[Any, np.dtype[np.uint8]]:
+        """Unpack 2-bit-per-element bytes back to values 0-3."""
+        b0 = packed & 0x03
+        b1 = (packed >> 2) & 0x03
+        b2 = (packed >> 4) & 0x03
+        b3 = (packed >> 6) & 0x03
+        interleaved = np.stack([b0, b1, b2, b3], axis=-1).ravel()
+        return interleaved[:num_elements].astype(np.uint8)
+
+    @staticmethod
+    def _rle_decode_legacy(data: bytes, size: int) -> np.ndarray[Any, np.dtype[np.float32]]:
+        """Decode legacy RLE-encoded payloads for backward compatibility."""
         result = np.empty(size, dtype=np.float32)
         offset = 0
         pos = 0
@@ -1178,6 +1241,28 @@ class MaskStrategy(BaseCompressionStrategy):
             result[pos:end] = val
             pos = end
         return result
+
+    @staticmethod
+    def _serialize_mask_value(value: float) -> float | str:
+        """Store non-finite palette values in a JSON-safe form."""
+        if np.isneginf(value):
+            return "-inf"
+        if np.isposinf(value):
+            return "inf"
+        if np.isnan(value):
+            return "nan"
+        return value
+
+    @staticmethod
+    def _deserialize_mask_value(value: Any) -> float:
+        """Restore mask palette values from their metadata representation."""
+        if value == "-inf":
+            return float("-inf")
+        if value == "inf":
+            return float("inf")
+        if value == "nan":
+            return float("nan")
+        return float(value)
 
 
 class DefaultStrategy(BaseCompressionStrategy):
