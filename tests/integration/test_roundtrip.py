@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 
 import quench
+from quench.backends import native_backend_available
+from quench.codec import QuenchDecoder, QuenchEncoder
+from quench.core.config import QuenchConfig
 
 
 def _compress_zstd(data: bytes) -> int | None:
@@ -123,3 +126,35 @@ def test_total_compression_is_better_than_raw_and_prints_summary() -> None:
     assert total_compressed < total_raw * 0.75
     if have_zstd:
         assert total_compressed <= int(total_zstd * 1.15)
+
+
+@pytest.mark.skipif(not native_backend_available(), reason="Rust backend not built")
+@pytest.mark.parametrize(
+    ("name", "mae_limit", "max_limit"),
+    [
+        ("attn.q_proj.weight", 0.025, 0.09),
+        ("layer_0.k_cache", 0.020, 0.09),
+        ("token_embed.weight", 0.030, 0.12),
+        ("block.activation", 0.050, 0.18),
+    ],
+)
+def test_representative_roundtrip_with_rust_entropy_backend(
+    name: str,
+    mae_limit: float,
+    max_limit: float,
+) -> None:
+    tensors = _representative_tensors()
+    tensor = tensors[name]
+    config = QuenchConfig(entropy_backend="rust")
+    encoder = QuenchEncoder(config=config)
+    decoder = QuenchDecoder(config=config)
+
+    compressed = encoder.encode(tensor, name=name)
+    restored = decoder.decode(compressed)
+
+    error = np.abs(restored.astype(np.float32) - tensor.astype(np.float32))
+    assert restored.shape == tensor.shape
+    assert restored.dtype == tensor.dtype
+    assert float(np.mean(error)) <= mae_limit
+    assert float(np.max(error)) <= max_limit
+    assert compressed.compressed_nbytes < tensor.nbytes

@@ -41,6 +41,9 @@ def build_tensor_suite(config: QuenchConfig | None = None, *, seed: int = 2025) 
         TensorBenchmarkCase("tensor/optimizer_state", "optimizer.exp_avg", "optimizer_state", state_dict["optimizer.exp_avg"], active_config),
         TensorBenchmarkCase("tensor/bias", "attn.q_proj.bias", "bias", state_dict["attn.q_proj.bias"], active_config),
         TensorBenchmarkCase("tensor/mixed_precision", "mlp.fp16_gate", "mixed_precision", state_dict["mlp.fp16_gate"], active_config),
+        TensorBenchmarkCase("tensor/entropy_zipf", "entropy.zipf_symbols", "entropy", _build_zipf_symbols(seed=seed), active_config),
+        TensorBenchmarkCase("tensor/entropy_gaussian", "entropy.gaussian_symbols", "entropy", _build_gaussian_symbols(seed=seed), active_config),
+        TensorBenchmarkCase("tensor/entropy_binary", "entropy.binary_symbols", "entropy", _build_binary_symbols(seed=seed), active_config),
     ]
 
 
@@ -94,3 +97,21 @@ def build_transformer_bundle(*, seed: int = 2025) -> dict[str, np.ndarray[Any, n
         "optimizer.exp_avg_sq": optimizer_exp_avg_sq,
         "token_embed.weight": token_embeddings,
     }
+
+
+def _build_zipf_symbols(*, seed: int) -> np.ndarray[Any, np.dtype[np.int16]]:
+    rng = np.random.default_rng(seed + 11)
+    values = np.minimum(rng.zipf(a=1.35, size=131_072), 256).astype(np.int16)
+    return (values - 1).reshape(1024, 128)
+
+
+def _build_gaussian_symbols(*, seed: int) -> np.ndarray[Any, np.dtype[np.int16]]:
+    rng = np.random.default_rng(seed + 17)
+    values = np.rint(rng.normal(loc=0.0, scale=18.0, size=131_072)).astype(np.int16)
+    return np.clip(values, -63, 63).reshape(1024, 128)
+
+
+def _build_binary_symbols(*, seed: int) -> np.ndarray[Any, np.dtype[np.int8]]:
+    rng = np.random.default_rng(seed + 23)
+    values = rng.choice([0, 1], size=262_144, p=[0.97, 0.03]).astype(np.int8)
+    return values.reshape(2048, 128)

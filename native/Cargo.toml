@@ -1,0 +1,16 @@
+[package]
+name = "quench-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "quench_native"
+crate-type = ["cdylib"]
+
+[package.metadata.maturin]
+module-name = "quench_native"
+
+[dependencies]
+numpy = "0.23"
+pyo3 = { version = "0.23", features = ["extension-module"] }

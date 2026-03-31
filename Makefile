@@ -1,7 +1,13 @@
-.PHONY: install test lint typecheck bench clean
+.PHONY: install native-build native-develop test lint typecheck bench clean
 
 install:
 	pip install -e ".[dev]"
+
+native-build:
+	cargo build --manifest-path native/Cargo.toml --release
+
+native-develop:
+	maturin develop --manifest-path native/Cargo.toml
 
 test:
 	pytest tests/ -v

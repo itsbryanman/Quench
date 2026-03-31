@@ -39,6 +39,9 @@ bench = [
     "zstandard>=0.22",
     "torch>=2.0",
 ]
+native = [
+    "maturin>=1.7,<2.0",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov",

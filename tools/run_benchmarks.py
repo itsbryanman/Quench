@@ -55,6 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-compression-ratio-drop", type=float, default=0.05)
     parser.add_argument("--max-error-increase", type=float, default=0.10)
     parser.add_argument("--max-throughput-drop", type=float, default=0.10)
+    parser.add_argument("--entropy-backend", default="python", help="Entropy backend to benchmark")
+    parser.add_argument("--packing-backend", default="python", help="Packing backend to benchmark")
+    parser.add_argument(
+        "--pack-bits",
+        action="store_true",
+        help="Enable backend bit-packing for eligible integer symbol streams",
+    )
     return parser
 
 
@@ -78,7 +85,11 @@ def main() -> None:
     try:
         json_path, csv_path, results, comparison_messages = run_benchmark_suite(
             args.output_dir,
-            config=QuenchConfig(),
+            config=QuenchConfig(
+                entropy_backend=args.entropy_backend,
+                packing_backend=args.packing_backend,
+                pack_bits=args.pack_bits,
+            ),
             repeats=args.repeats,
             seed=args.seed,
             suite=args.suite,
