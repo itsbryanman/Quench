@@ -125,3 +125,4 @@ class TensorStats:
     max_val: float
     sparsity: float  # fraction of values with abs < 1e-6
     entropy_bits: float  # estimated Shannon entropy per element
+    effective_rank: float | None = None  # Shannon effective rank for 2D tensors

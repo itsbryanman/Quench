@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import math
+import subprocess
 
 import numpy as np
-import pytest
 
 from quench.entropy.bitstream import BitstreamReader, BitstreamWriter
 from quench.entropy.freq_model import FrequencyModel
@@ -14,6 +14,22 @@ from quench.entropy.rans import (
     build_freq_table,
     normalize_freq_table,
 )
+
+
+def _compress_zstd(data: bytes, level: int) -> bytes:
+    """Compress bytes with zstd using the Python package or CLI fallback."""
+    try:
+        import zstandard
+    except Exception:
+        completed = subprocess.run(
+            ["zstd", f"-{level}", "-q", "-c"],
+            input=data,
+            capture_output=True,
+            check=True,
+        )
+        return completed.stdout
+
+    return zstandard.ZstdCompressor(level=level).compress(data)
 
 # ---------------------------------------------------------------------------
 # rANS round-trip correctness
@@ -41,7 +57,9 @@ class TestRANSRoundtrip:
         decoded = self._roundtrip(zipf_symbols)
         np.testing.assert_array_equal(decoded, zipf_symbols)
 
-    def test_gaussian_quantized(self, gaussian_quantized: np.ndarray) -> None:  # type: ignore[type-arg]
+    def test_gaussian_quantized(
+        self, gaussian_quantized: np.ndarray
+    ) -> None:  # type: ignore[type-arg]
         symbols = gaussian_quantized.astype(np.int64)
         decoded = self._roundtrip(symbols)
         np.testing.assert_array_equal(decoded, symbols)
@@ -115,8 +133,6 @@ class TestCompressionQuality:
         assert rans_bits < shannon_bits * 1.10
 
     def test_beats_zstd_on_zipf(self) -> None:
-        zstd = pytest.importorskip("zstandard")
-
         rng = np.random.default_rng(42)
         alpha = 1.5
         vocab = 256
@@ -131,12 +147,10 @@ class TestCompressionQuality:
         rans_size = len(payload) + len(model_bytes)
 
         # zstd level 3
-        cctx3 = zstd.ZstdCompressor(level=3)
-        zstd3_size = len(cctx3.compress(raw_bytes))
+        zstd3_size = len(_compress_zstd(raw_bytes, level=3))
 
         # zstd level 19
-        cctx19 = zstd.ZstdCompressor(level=19)
-        zstd19_size = len(cctx19.compress(raw_bytes))
+        zstd19_size = len(_compress_zstd(raw_bytes, level=19))
 
         shannon_bits = self._shannon_bits(symbols)
         shannon_bytes = shannon_bits / 8
@@ -155,7 +169,6 @@ class TestCompressionQuality:
         """Simulate quantized model weights: Laplacian distribution (peaked at
         zero, heavy tails) quantized to 4-bit (16 levels).  This is what real
         INT4 model weights look like after quantization."""
-        zstd = pytest.importorskip("zstandard")
 
         rng = np.random.default_rng(42)
         # Laplacian(0, 0.5) → strongly peaked at 0, realistic for weights
@@ -172,12 +185,10 @@ class TestCompressionQuality:
         rans_size = len(payload) + len(model_bytes)
 
         # zstd level 3
-        cctx3 = zstd.ZstdCompressor(level=3)
-        zstd3_size = len(cctx3.compress(raw_bytes))
+        zstd3_size = len(_compress_zstd(raw_bytes, level=3))
 
         # zstd level 19
-        cctx19 = zstd.ZstdCompressor(level=19)
-        zstd19_size = len(cctx19.compress(raw_bytes))
+        zstd19_size = len(_compress_zstd(raw_bytes, level=19))
 
         shannon_bits = self._shannon_bits(symbols)
         shannon_bytes = shannon_bits / 8

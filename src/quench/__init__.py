@@ -5,8 +5,20 @@ from typing import Any
 
 import numpy as np
 
+from quench.analyze import TensorProfiler, TensorTypeDetector
 from quench.core.config import QuenchConfig
 from quench.core.types import CodecMode, CompressedTensor, QuantMode, TensorHeader, TensorType
+from quench.quantize import Calibrator, ImportanceAllocator, QuantParams, UniformQuantizer
+from quench.transform import (
+    ChannelNormalizer,
+    DeltaCoder,
+    PCAState,
+    PCATransform,
+    SparseEncoder,
+    SparseRepresentation,
+    StepMetadata,
+    TransformPipeline,
+)
 
 __version__ = "0.1.0"
 
@@ -34,12 +46,26 @@ def decompress(data: CompressedTensor, **kwargs: Any) -> np.ndarray[Any, np.dtyp
 
 
 __all__ = [
+    "Calibrator",
+    "ChannelNormalizer",
     "CodecMode",
     "CompressedTensor",
+    "DeltaCoder",
+    "ImportanceAllocator",
+    "PCAState",
+    "PCATransform",
+    "QuantParams",
     "QuenchConfig",
     "QuantMode",
+    "SparseEncoder",
+    "SparseRepresentation",
+    "StepMetadata",
+    "TensorProfiler",
     "TensorHeader",
+    "TensorTypeDetector",
     "TensorType",
+    "TransformPipeline",
+    "UniformQuantizer",
     "__version__",
     "compress",
     "decompress",
