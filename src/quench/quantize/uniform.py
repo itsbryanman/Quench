@@ -1,68 +1,61 @@
 """Uniform tensor quantization."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+from quench.core.config import QuantizationGranularity
 from quench.core.exceptions import QuantizationError
 from quench.core.types import QuantMode
+from quench.quantize.base import (
+    BlockQuantParams,
+    ChannelQuantParams,
+    QuantParams,
+    QuantizationLayout,
+    compute_scalar_params,
+    quantized_bounds,
+    storage_dtype,
+)
 
 
-@dataclass(frozen=True)
-class QuantParams:
-    """Quantization parameters for uniform affine quantization."""
+class PerTensorQuantizer:
+    """Uniform quantizer that applies one parameter set to an entire tensor."""
 
-    scale: float
-    zero_point: int
-    bits: int
-    mode: QuantMode
-    dtype_orig: str
-    value_range_min: float
-    value_range_max: float
-
-
-class UniformQuantizer:
-    """Uniform tensor quantizer with auditable scalar parameters."""
+    def __init__(self) -> None:
+        self.layout = QuantizationLayout(QuantizationGranularity.PER_TENSOR)
 
     def quantize(
         self,
         tensor: np.ndarray[Any, np.dtype[Any]],
-        bits: int,
-        mode: QuantMode,
-    ) -> tuple[np.ndarray[Any, np.dtype[Any]], QuantParams]:
-        """Quantize *tensor* with *bits* and *mode*."""
+        params: QuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Quantize *tensor* using explicit scalar affine parameters."""
         values = np.asarray(tensor)
         if values.size == 0:
             raise QuantizationError("Cannot quantize an empty tensor")
+        if params.scale <= 0.0:
+            raise QuantizationError("Quantization scale must be positive")
 
         working = values.astype(np.float64, copy=False)
-        params = self._compute_params(
-            value_min=float(np.min(working)),
-            value_max=float(np.max(working)),
-            bits=bits,
-            mode=mode,
-            dtype_orig=values.dtype.str,
-        )
-        qmin, qmax = self._quantized_bounds(bits, mode)
+        qmin, qmax = quantized_bounds(params.bits, params.mode)
 
-        if mode == QuantMode.SYMMETRIC:
+        if params.mode == QuantMode.SYMMETRIC:
             scaled = np.rint(working / params.scale)
-        elif mode == QuantMode.ASYMMETRIC:
+        elif params.mode == QuantMode.ASYMMETRIC:
             scaled = np.rint(working / params.scale) + params.zero_point
         else:
-            raise QuantizationError("UniformQuantizer does not support QuantMode.NONE")
+            raise QuantizationError("PerTensorQuantizer does not support QuantMode.NONE")
 
         clipped = np.clip(scaled, qmin, qmax)
-        return clipped.astype(self._storage_dtype(bits, mode), copy=False), params
+        return clipped.astype(storage_dtype(params.bits, params.mode), copy=False)
 
     def dequantize(
         self,
         quantized: np.ndarray[Any, np.dtype[Any]],
         params: QuantParams,
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        """Dequantize *quantized* values using *params*."""
+        """Dequantize *quantized* using scalar affine parameters."""
         if params.scale <= 0.0:
             raise QuantizationError("Quantization scale must be positive")
 
@@ -72,13 +65,168 @@ class UniformQuantizer:
         elif params.mode == QuantMode.ASYMMETRIC:
             restored = (values - params.zero_point) * params.scale
         else:
-            raise QuantizationError("UniformQuantizer does not support QuantMode.NONE")
+            raise QuantizationError("PerTensorQuantizer does not support QuantMode.NONE")
 
         return restored.astype(np.dtype(params.dtype_orig), copy=False)
 
-    @classmethod
+
+class PerChannelQuantizer:
+    """Uniform quantizer that applies one parameter set per tensor channel."""
+
+    def __init__(self, axis: int = 0) -> None:
+        self.layout = QuantizationLayout(QuantizationGranularity.PER_CHANNEL, axis=axis)
+        self._per_tensor = PerTensorQuantizer()
+
+    def quantize(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        params: ChannelQuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Quantize *tensor* independently for each channel."""
+        values = np.asarray(tensor)
+        axis = self.layout.normalized_axis(values.ndim)
+        if params.axis != axis:
+            raise QuantizationError("Per-channel parameter axis does not match quantizer axis")
+        if values.shape != params.shape:
+            raise QuantizationError("Per-channel parameter shape does not match tensor shape")
+
+        moved = np.moveaxis(values, axis, 0)
+        if moved.shape[0] != len(params.params):
+            raise QuantizationError("Per-channel parameter count does not match the tensor axis length")
+        quantized_channels = [
+            self._per_tensor.quantize(channel, channel_params)
+            for channel, channel_params in zip(moved, params.params)
+        ]
+        return np.moveaxis(np.stack(quantized_channels, axis=0), 0, axis)
+
+    def dequantize(
+        self,
+        quantized: np.ndarray[Any, np.dtype[Any]],
+        params: ChannelQuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Dequantize *quantized* using one parameter set per channel."""
+        values = np.asarray(quantized)
+        axis = self.layout.normalized_axis(values.ndim)
+        if params.axis != axis:
+            raise QuantizationError("Per-channel parameter axis does not match quantizer axis")
+        if values.shape != params.shape:
+            raise QuantizationError("Per-channel parameter shape does not match tensor shape")
+
+        moved = np.moveaxis(values, axis, 0)
+        if moved.shape[0] != len(params.params):
+            raise QuantizationError("Per-channel parameter count does not match the tensor axis length")
+        restored_channels = [
+            self._per_tensor.dequantize(channel, channel_params)
+            for channel, channel_params in zip(moved, params.params)
+        ]
+        return np.moveaxis(np.stack(restored_channels, axis=0), 0, axis)
+
+
+class BlockwiseQuantizer:
+    """Uniform quantizer that applies one parameter set per axis-aligned block."""
+
+    def __init__(self, axis: int = 0, block_size: int = 128) -> None:
+        if block_size <= 0:
+            raise QuantizationError("block_size must be positive")
+        self.layout = QuantizationLayout(
+            QuantizationGranularity.BLOCKWISE,
+            axis=axis,
+            block_size=block_size,
+        )
+        self._per_tensor = PerTensorQuantizer()
+
+    def quantize(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        params: BlockQuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Quantize *tensor* blockwise along the configured axis."""
+        values = np.asarray(tensor)
+        axis = self.layout.normalized_axis(values.ndim)
+        self._validate_params(values, params, axis)
+
+        moved = np.moveaxis(values, axis, 0)
+        quantized_blocks = []
+        offset = 0
+        for length, block_params in zip(params.block_lengths, params.params):
+            quantized_blocks.append(
+                self._per_tensor.quantize(moved[offset : offset + length], block_params)
+            )
+            offset += length
+        return np.moveaxis(np.concatenate(quantized_blocks, axis=0), 0, axis)
+
+    def dequantize(
+        self,
+        quantized: np.ndarray[Any, np.dtype[Any]],
+        params: BlockQuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Dequantize *quantized* blockwise along the configured axis."""
+        values = np.asarray(quantized)
+        axis = self.layout.normalized_axis(values.ndim)
+        self._validate_params(values, params, axis)
+
+        moved = np.moveaxis(values, axis, 0)
+        restored_blocks = []
+        offset = 0
+        for length, block_params in zip(params.block_lengths, params.params):
+            restored_blocks.append(
+                self._per_tensor.dequantize(moved[offset : offset + length], block_params)
+            )
+            offset += length
+        return np.moveaxis(np.concatenate(restored_blocks, axis=0), 0, axis)
+
+    def _validate_params(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        params: BlockQuantParams,
+        axis: int,
+    ) -> None:
+        if params.axis != axis:
+            raise QuantizationError("Blockwise parameter axis does not match quantizer axis")
+        if params.block_size != self.layout.block_size:
+            raise QuantizationError("Blockwise parameter size does not match quantizer block size")
+        if tensor.shape != params.shape:
+            raise QuantizationError("Blockwise parameter shape does not match tensor shape")
+        if sum(params.block_lengths) != tensor.shape[axis]:
+            raise QuantizationError("Blockwise parameter lengths do not cover the tensor axis")
+
+
+class UniformQuantizer:
+    """Backward-compatible per-tensor uniform quantizer facade."""
+
+    def __init__(self) -> None:
+        self._per_tensor = PerTensorQuantizer()
+
+    def quantize(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        bits: int,
+        mode: QuantMode,
+    ) -> tuple[np.ndarray[Any, np.dtype[Any]], QuantParams]:
+        """Quantize *tensor* with scalar min/max calibration."""
+        values = np.asarray(tensor)
+        if values.size == 0:
+            raise QuantizationError("Cannot quantize an empty tensor")
+        working = values.astype(np.float64, copy=False)
+        params = self._compute_params(
+            value_min=float(np.min(working)),
+            value_max=float(np.max(working)),
+            bits=bits,
+            mode=mode,
+            dtype_orig=values.dtype.str,
+        )
+        return self._per_tensor.quantize(values, params), params
+
+    def dequantize(
+        self,
+        quantized: np.ndarray[Any, np.dtype[Any]],
+        params: QuantParams,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        """Dequantize *quantized* values using scalar params."""
+        return self._per_tensor.dequantize(quantized, params)
+
+    @staticmethod
     def _compute_params(
-        cls,
         value_min: float,
         value_max: float,
         bits: int,
@@ -86,70 +234,10 @@ class UniformQuantizer:
         dtype_orig: str,
     ) -> QuantParams:
         """Compute quantization parameters from a clipped value range."""
-        cls._validate_bits(bits)
-
-        if mode == QuantMode.SYMMETRIC:
-            qmin, qmax = cls._quantized_bounds(bits, mode)
-            max_abs = max(abs(value_min), abs(value_max))
-            scale = max_abs / max(abs(qmin), qmax, 1)
-            scale = 1.0 if scale == 0.0 or not np.isfinite(scale) else float(scale)
-            zero_point = 0
-        elif mode == QuantMode.ASYMMETRIC:
-            qmin, qmax = cls._quantized_bounds(bits, mode)
-            if value_max == value_min:
-                if value_max == 0.0:
-                    scale = 1.0
-                    zero_point = 0
-                else:
-                    scale = abs(value_max) / max(qmax, 1)
-                    zero_point = qmax if value_max < 0.0 else 0
-            else:
-                scale = (value_max - value_min) / max(qmax - qmin, 1)
-                scale = 1.0 if scale == 0.0 or not np.isfinite(scale) else float(scale)
-                zero_point = int(np.rint(-value_min / scale))
-                zero_point = int(np.clip(zero_point, qmin, qmax))
-        else:
-            raise QuantizationError("UniformQuantizer does not support QuantMode.NONE")
-
-        return QuantParams(
-            scale=float(scale),
-            zero_point=int(zero_point),
+        return compute_scalar_params(
+            value_min=value_min,
+            value_max=value_max,
             bits=bits,
             mode=mode,
             dtype_orig=dtype_orig,
-            value_range_min=float(value_min),
-            value_range_max=float(value_max),
         )
-
-    @staticmethod
-    def _validate_bits(bits: int) -> None:
-        """Validate the requested bit width."""
-        if not (1 <= bits <= 32):
-            raise QuantizationError(f"bits must be in [1, 32], got {bits}")
-
-    @staticmethod
-    def _quantized_bounds(bits: int, mode: QuantMode) -> tuple[int, int]:
-        """Return the representable integer bounds for *bits* and *mode*."""
-        if mode == QuantMode.SYMMETRIC:
-            qmax = 1 if bits == 1 else (1 << (bits - 1)) - 1
-            qmin = -qmax
-            return qmin, qmax
-        if mode == QuantMode.ASYMMETRIC:
-            return 0, (1 << bits) - 1
-        raise QuantizationError("UniformQuantizer does not support QuantMode.NONE")
-
-    @staticmethod
-    def _storage_dtype(bits: int, mode: QuantMode) -> type[np.generic]:
-        """Choose the smallest practical storage dtype for the quantized tensor."""
-        if mode == QuantMode.SYMMETRIC:
-            if bits <= 8:
-                return np.int8
-            if bits <= 16:
-                return np.int16
-            return np.int32
-
-        if bits <= 8:
-            return np.uint8
-        if bits <= 16:
-            return np.uint16
-        return np.uint32

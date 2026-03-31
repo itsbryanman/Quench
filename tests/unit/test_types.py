@@ -20,9 +20,11 @@ class TestTensorType:
         assert TensorType.ACTIVATION == 3
         assert TensorType.OPTIMIZER_STATE == 4
         assert TensorType.UNKNOWN == 5
+        assert TensorType.BIAS == 6
+        assert TensorType.MIXED_PRECISION == 7
 
     def test_all_members(self) -> None:
-        assert len(TensorType) == 6
+        assert len(TensorType) == 8
 
 
 class TestTensorHeader:

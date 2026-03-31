@@ -1,6 +1,7 @@
 """Integration helpers for external tensor storage formats."""
 from quench.integrations.safetensors import (
     deserialize_metadata,
+    iter_tensor_mapping,
     load_compressed,
     load_compressed_bundle,
     load_tensor_mapping,
@@ -12,6 +13,7 @@ from quench.integrations.safetensors import (
 
 __all__ = [
     "deserialize_metadata",
+    "iter_tensor_mapping",
     "load_compressed",
     "load_compressed_bundle",
     "load_tensor_mapping",

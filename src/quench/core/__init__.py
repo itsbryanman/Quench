@@ -1,6 +1,7 @@
 """Core types, configuration, and exceptions."""
-from quench.core.config import QuenchConfig
+from quench.core.config import CalibrationPolicyKind, QuantizationGranularity, QuenchConfig
 from quench.core.exceptions import (
+    BackendError,
     ChecksumMismatchError,
     CodecError,
     EntropyError,
@@ -9,6 +10,7 @@ from quench.core.exceptions import (
     MetadataError,
     QuantizationError,
     QuenchError,
+    UnsupportedBackendError,
     UnsupportedStrategyError,
 )
 from quench.core.types import (
@@ -21,6 +23,8 @@ from quench.core.types import (
 )
 
 __all__ = [
+    "BackendError",
+    "CalibrationPolicyKind",
     "CodecError",
     "CodecMode",
     "CompressedTensor",
@@ -33,8 +37,10 @@ __all__ = [
     "QuantizationError",
     "QuenchConfig",
     "QuenchError",
+    "QuantizationGranularity",
     "TensorHeader",
     "TensorStats",
     "TensorType",
+    "UnsupportedBackendError",
     "UnsupportedStrategyError",
 ]

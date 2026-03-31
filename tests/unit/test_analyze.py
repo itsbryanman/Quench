@@ -30,6 +30,16 @@ class TestTensorTypeDetector:
         assert detector.detect(gaussian_weight) == TensorType.WEIGHT
         assert detector.detect(sparse_activation) == TensorType.ACTIVATION
 
+    def test_optimizer_bias_and_mixed_precision_heuristics(self) -> None:
+        detector = TensorTypeDetector()
+        optimizer = np.ones((32, 32), dtype=np.float32)
+        bias = np.ones((64,), dtype=np.float32)
+        mixed = np.ones((16, 16), dtype=np.float16)
+
+        assert detector.detect(optimizer, "optimizer.exp_avg") == TensorType.OPTIMIZER_STATE
+        assert detector.detect(bias, "proj.bias") == TensorType.BIAS
+        assert detector.detect(mixed, "mlp.fp16_gate") == TensorType.MIXED_PRECISION
+
 
 class TestTensorProfiler:
     def test_profile_2d_tensor_includes_effective_rank(self) -> None:

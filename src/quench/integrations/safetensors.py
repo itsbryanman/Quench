@@ -1,30 +1,8 @@
-"""Bundle I/O helpers for Quench compressed tensors.
-
-The `.qnc` container format is intentionally simple and deterministic:
-
-File header:
-    - 4 bytes magic: ``QNCB``
-    - 2 bytes bundle version (uint16, little-endian)
-    - 4 bytes tensor count (uint32, little-endian)
-
-For each tensor, in sorted name order:
-    - 4 bytes tensor name length (uint32)
-    - tensor name bytes (UTF-8)
-    - 4 bytes serialized header length (uint32)
-    - serialized header bytes
-    - 8 bytes metadata length (uint64)
-    - metadata bytes
-    - 8 bytes payload length (uint64)
-    - payload bytes
-
-The per-tensor `original_nbytes` field is derived from the stored header dtype
-and shape when loading the bundle.
-"""
+"""Bundle and tensor mapping I/O helpers for Quench."""
 from __future__ import annotations
 
-import struct
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, TypeAlias
 
 import numpy as np
 
@@ -34,23 +12,23 @@ from quench.codec.metadata import deserialize_metadata as _deserialize_metadata
 from quench.codec.metadata import serialize_metadata as _serialize_metadata
 from quench.core.config import QuenchConfig
 from quench.core.exceptions import CodecError
-from quench.core.header import decode_header, encode_header
 from quench.core.types import CompressedTensor
+from quench.io import QNCReader, QNCWriter
 
 try:  # pragma: no cover - optional dependency
+    from safetensors import safe_open as _safe_open
     from safetensors.numpy import load_file as _load_safetensors
     from safetensors.numpy import save_file as _save_safetensors
 except Exception:  # pragma: no cover - optional dependency
+    _safe_open = None
     _load_safetensors = None
     _save_safetensors = None
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import torch
 
-_BUNDLE_MAGIC = b"QNCB"
-_BUNDLE_VERSION = 1
-_BUNDLE_HEADER = struct.Struct("<4sHI")
-_NAME_LENGTH = struct.Struct("<I")
-_HEADER_LENGTH = struct.Struct("<I")
-_BLOB_LENGTH = struct.Struct("<Q")
+
+TensorLike: TypeAlias = np.ndarray[Any, np.dtype[Any]] | Any
 
 
 def serialize_metadata(metadata: dict[str, Any]) -> bytes:
@@ -65,12 +43,23 @@ def deserialize_metadata(data: bytes) -> dict[str, Any]:
 
 def save_compressed(
     path: str | Path,
-    state_dict: dict[str, np.ndarray[Any, np.dtype[Any]] | Any],
+    state_dict: Mapping[str, TensorLike] | Iterable[tuple[str, TensorLike]],
     config: QuenchConfig | None = None,
+    *,
+    chunk_size: int = 1 << 20,
 ) -> None:
-    """Compress a tensor mapping and write it to a `.qnc` bundle."""
+    """Compress a tensor mapping and write it to a `.qnc` bundle incrementally."""
     encoder = QuenchEncoder(config=config)
-    save_compressed_bundle(path, encoder.encode_dict(state_dict, config=config))
+    tensor_count = _mapping_length(state_dict)
+    with QNCWriter(path, tensor_count=tensor_count, chunk_size=chunk_size) as writer:
+        if isinstance(state_dict, Mapping):
+            for name, compressed in encoder.iter_encode_dict(dict(state_dict), config=config):
+                writer.write_compressed_tensor(name, compressed, chunk_size=chunk_size)
+            return
+
+        for name, tensor in _iter_sorted_items(state_dict):
+            compressed = encoder.encode(tensor, name=name)
+            writer.write_compressed_tensor(name, compressed, chunk_size=chunk_size)
 
 
 def load_compressed(
@@ -79,114 +68,88 @@ def load_compressed(
 ) -> dict[str, np.ndarray[Any, np.dtype[Any]]]:
     """Load and decompress a `.qnc` bundle into numpy tensors."""
     decoder = QuenchDecoder(config=config)
-    return decoder.decode_dict(load_compressed_bundle(path))
+    restored: dict[str, np.ndarray[Any, np.dtype[Any]]] = {}
+    for record in QNCReader(path).iter_tensor_records():
+        restored[record.name] = decoder.decode(record.to_compressed_tensor())
+    return restored
 
 
 def save_compressed_bundle(
     path: str | Path,
-    tensors: dict[str, CompressedTensor],
+    tensors: Mapping[str, CompressedTensor],
+    *,
+    chunk_size: int = 1 << 20,
 ) -> None:
     """Write an already-compressed tensor mapping to a `.qnc` bundle."""
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    with destination.open("wb") as handle:
-        handle.write(_BUNDLE_HEADER.pack(_BUNDLE_MAGIC, _BUNDLE_VERSION, len(tensors)))
+    with QNCWriter(path, tensor_count=len(tensors), chunk_size=chunk_size) as writer:
         for name in sorted(tensors):
-            compressed = tensors[name]
-            name_bytes = name.encode("utf-8")
-            header_bytes = encode_header(compressed.header)
-
-            handle.write(_NAME_LENGTH.pack(len(name_bytes)))
-            handle.write(name_bytes)
-            handle.write(_HEADER_LENGTH.pack(len(header_bytes)))
-            handle.write(header_bytes)
-            handle.write(_BLOB_LENGTH.pack(len(compressed.metadata)))
-            handle.write(compressed.metadata)
-            handle.write(_BLOB_LENGTH.pack(len(compressed.payload)))
-            handle.write(compressed.payload)
+            writer.write_compressed_tensor(name, tensors[name], chunk_size=chunk_size)
 
 
 def load_compressed_bundle(path: str | Path) -> dict[str, CompressedTensor]:
     """Load a `.qnc` bundle without decoding its payloads."""
-    source = Path(path)
-    with source.open("rb") as handle:
-        magic, version, tensor_count = _read_struct(handle, _BUNDLE_HEADER, "bundle header")
-        if magic != _BUNDLE_MAGIC:
-            raise CodecError(f"QNC bundle magic mismatch: expected {_BUNDLE_MAGIC!r}, got {magic!r}")
-        if version != _BUNDLE_VERSION:
-            raise CodecError(
-                f"Unsupported QNC bundle version: expected {_BUNDLE_VERSION}, got {version}"
-            )
-
-        tensors: dict[str, CompressedTensor] = {}
-        for _ in range(tensor_count):
-            (name_len,) = _read_struct(handle, _NAME_LENGTH, "tensor name length")
-            name = _read_exact(handle, name_len, "tensor name").decode("utf-8")
-
-            (header_len,) = _read_struct(handle, _HEADER_LENGTH, "tensor header length")
-            header = decode_header(_read_exact(handle, header_len, "tensor header"))
-
-            (metadata_len,) = _read_struct(handle, _BLOB_LENGTH, "metadata length")
-            metadata = _read_exact(handle, metadata_len, "tensor metadata")
-
-            (payload_len,) = _read_struct(handle, _BLOB_LENGTH, "payload length")
-            payload = _read_exact(handle, payload_len, "tensor payload")
-
-            if name in tensors:
-                raise CodecError(f"Duplicate tensor name in QNC bundle: {name}")
-
-            original_nbytes = _header_nbytes(header.dtype, header.shape)
-            tensors[name] = CompressedTensor(
-                header=header,
-                payload=payload,
-                metadata=metadata,
-                original_nbytes=original_nbytes,
-            )
-
-        trailing = handle.read(1)
-        if trailing:
-            raise CodecError("QNC bundle has trailing bytes after the last tensor")
-
+    tensors: dict[str, CompressedTensor] = {}
+    for record in QNCReader(path).iter_tensor_records():
+        if record.name in tensors:
+            raise CodecError(f"Duplicate tensor name in QNC bundle: {record.name}")
+        tensors[record.name] = record.to_compressed_tensor()
     return tensors
 
 
-def load_tensor_mapping(path: str | Path) -> dict[str, np.ndarray[Any, np.dtype[Any]]]:
-    """Load a tensor mapping from `.qnc`, `.npz`, `.npy`, `.safetensors`, or a directory."""
+def iter_tensor_mapping(
+    path: str | Path,
+) -> Iterator[tuple[str, np.ndarray[Any, np.dtype[Any]]]]:
+    """Iterate tensors from `.qnc`, `.npz`, `.npy`, `.safetensors`, or a directory."""
     source = Path(path)
     if not source.exists():
         raise FileNotFoundError(source)
 
     if source.is_dir():
-        tensors: dict[str, np.ndarray[Any, np.dtype[Any]]] = {}
         for file_path in sorted(source.rglob("*.npy")):
             name = str(file_path.relative_to(source).with_suffix("")).replace("\\", "/")
-            tensors[name] = np.load(file_path, allow_pickle=False)
-        if not tensors:
-            raise CodecError(f"No .npy files found in directory: {source}")
-        return tensors
+            yield name, np.load(file_path, allow_pickle=False)
+        return
 
     if source.suffix == ".qnc":
-        return load_compressed(source)
+        yield from load_compressed(source).items()
+        return
     if source.suffix == ".npz":
         with np.load(source, allow_pickle=False) as loaded:
-            return {name: np.asarray(loaded[name]) for name in sorted(loaded.files)}
+            for name in sorted(loaded.files):
+                yield name, np.asarray(loaded[name])
+        return
     if source.suffix == ".npy":
-        return {source.stem: np.load(source, allow_pickle=False)}
+        yield source.stem, np.load(source, allow_pickle=False)
+        return
     if source.suffix == ".safetensors":
+        if _safe_open is not None:
+            with _safe_open(str(source), framework="numpy") as handle:
+                for name in sorted(handle.keys()):
+                    yield name, np.asarray(handle.get_tensor(name))
+            return
         if _load_safetensors is None:
             raise CodecError(
                 "Loading .safetensors requires the optional safetensors package; "
                 "use .npz or a directory of .npy files instead."
             )
-        return {name: np.asarray(value) for name, value in _load_safetensors(str(source)).items()}
+        for name, value in sorted(_load_safetensors(str(source)).items()):
+            yield name, np.asarray(value)
+        return
 
     raise CodecError(f"Unsupported tensor input format: {source.suffix or str(source)}")
 
 
+def load_tensor_mapping(path: str | Path) -> dict[str, np.ndarray[Any, np.dtype[Any]]]:
+    """Load a tensor mapping from disk into memory."""
+    tensors = dict(iter_tensor_mapping(path))
+    if not tensors:
+        raise CodecError(f"No tensors found at {path}")
+    return tensors
+
+
 def save_tensor_mapping(
     path: str | Path,
-    tensors: dict[str, np.ndarray[Any, np.dtype[Any]]],
+    tensors: Mapping[str, np.ndarray[Any, np.dtype[Any]]],
 ) -> None:
     """Save a tensor mapping as `.npz`, `.npy`, `.safetensors`, or a directory."""
     destination = Path(path)
@@ -216,20 +179,19 @@ def save_tensor_mapping(
         np.save(file_path, np.asarray(value))
 
 
-def _read_struct(handle: Any, fmt: struct.Struct, label: str) -> tuple[Any, ...]:
-    """Read and unpack a fixed-size struct from *handle*."""
-    return fmt.unpack(_read_exact(handle, fmt.size, label))
+def _mapping_length(
+    mapping_or_items: Mapping[str, TensorLike] | Iterable[tuple[str, TensorLike]],
+) -> int | None:
+    if isinstance(mapping_or_items, Mapping):
+        return len(mapping_or_items)
+    return None
 
 
-def _read_exact(handle: Any, length: int, label: str) -> bytes:
-    """Read exactly *length* bytes or raise a clear bundle error."""
-    data = handle.read(length)
-    if len(data) != length:
-        raise CodecError(f"Unexpected EOF while reading {label}")
-    return data
-
-
-def _header_nbytes(dtype_name: str, shape: tuple[int, ...]) -> int:
-    """Derive the original tensor size from header dtype and shape."""
-    dtype = np.dtype(dtype_name)
-    return int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+def _iter_sorted_items(
+    mapping_or_items: Mapping[str, TensorLike] | Iterable[tuple[str, TensorLike]],
+) -> Iterator[tuple[str, TensorLike]]:
+    if isinstance(mapping_or_items, Mapping):
+        for name in sorted(mapping_or_items):
+            yield name, mapping_or_items[name]
+        return
+    yield from mapping_or_items

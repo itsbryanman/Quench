@@ -35,3 +35,11 @@ class QuantizationError(QuenchError):
 
 class EntropyError(QuenchError):
     """Error in entropy coding (rANS encode/decode)."""
+
+
+class BackendError(QuenchError):
+    """Error raised while resolving or invoking a codec backend."""
+
+
+class UnsupportedBackendError(BackendError):
+    """Error raised when a requested backend name is not registered."""

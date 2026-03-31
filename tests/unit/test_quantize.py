@@ -3,8 +3,19 @@ from __future__ import annotations
 
 import numpy as np
 
+from quench.core.config import QuantizationGranularity
 from quench.core.types import QuantMode
-from quench.quantize import Calibrator, ImportanceAllocator, UniformQuantizer
+from quench.quantize import (
+    BlockwiseCalibrationPolicy,
+    BlockwiseQuantizer,
+    Calibrator,
+    ImportanceAllocator,
+    PerChannelCalibrationPolicy,
+    PerChannelQuantizer,
+    PercentileCalibrationPolicy,
+    QuantizationLayout,
+    UniformQuantizer,
+)
 
 
 class TestUniformQuantizer:
@@ -93,6 +104,55 @@ class TestCalibrator:
 
         assert clipped.scale < full.scale
         assert clipped.value_range_max < full.value_range_max
+
+    def test_per_channel_quantizer_roundtrip(self) -> None:
+        rng = np.random.default_rng(99)
+        tensor = rng.normal(size=(4, 32)).astype(np.float32)
+        layout = QuantizationLayout(QuantizationGranularity.PER_CHANNEL, axis=0)
+        policy = PerChannelCalibrationPolicy()
+        quantizer = PerChannelQuantizer(axis=0)
+
+        params = policy.calibrate(tensor, bits=5, mode=QuantMode.SYMMETRIC, layout=layout)
+        quantized = quantizer.quantize(tensor, params)
+        restored = quantizer.dequantize(quantized, params)
+
+        assert quantized.shape == tensor.shape
+        assert restored.shape == tensor.shape
+        np.testing.assert_allclose(restored, tensor, atol=max(param.scale for param in params.params))
+
+    def test_blockwise_quantizer_roundtrip(self) -> None:
+        rng = np.random.default_rng(1234)
+        tensor = rng.normal(size=(8, 16)).astype(np.float32)
+        layout = QuantizationLayout(QuantizationGranularity.BLOCKWISE, axis=0, block_size=3)
+        policy = BlockwiseCalibrationPolicy()
+        quantizer = BlockwiseQuantizer(axis=0, block_size=3)
+
+        params = policy.calibrate(tensor, bits=4, mode=QuantMode.SYMMETRIC, layout=layout)
+        quantized = quantizer.quantize(tensor, params)
+        restored = quantizer.dequantize(quantized, params)
+
+        assert params.block_lengths == (3, 3, 2)
+        np.testing.assert_allclose(
+            restored,
+            tensor,
+            atol=max(param.scale for param in params.params),
+        )
+
+    def test_percentile_policy_supports_blockwise_layout(self) -> None:
+        rng = np.random.default_rng(5)
+        tensor = rng.normal(size=(6, 8)).astype(np.float32)
+        tensor[0, 0] = 100.0
+        layout = QuantizationLayout(QuantizationGranularity.BLOCKWISE, axis=0, block_size=2)
+
+        params = PercentileCalibrationPolicy(percentile=95.0).calibrate(
+            tensor,
+            bits=4,
+            mode=QuantMode.SYMMETRIC,
+            layout=layout,
+        )
+
+        assert len(params.params) == 3
+        assert max(param.value_range_max for param in params.params) < 100.0
 
 
 class TestImportanceAllocator:

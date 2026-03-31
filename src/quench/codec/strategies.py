@@ -7,20 +7,31 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from quench.core.config import QuenchConfig
+from quench.backends.registry import get_entropy_backend, get_packing_backend
+from quench.core.config import (
+    CalibrationPolicyKind,
+    QuantizationGranularity,
+    QuenchConfig,
+)
 from quench.core.exceptions import MalformedPayloadError, UnsupportedStrategyError
 from quench.core.types import CodecMode, QuantMode, TensorType
 from quench.entropy.freq_model import FrequencyModel
-from quench.entropy.rans import (
-    RANSEncoder,
-    RANSDecoder,
-    SCALE,
-    build_freq_table,
-    normalize_freq_table,
+from quench.entropy.rans import SCALE, build_freq_table, normalize_freq_table
+from quench.quantize import (
+    BlockwiseCalibrationPolicy,
+    BlockwiseQuantizer,
+    PerChannelCalibrationPolicy,
+    PerChannelQuantizer,
+    PerTensorCalibrationPolicy,
+    PerTensorQuantizer,
+    PercentileCalibrationPolicy,
+    QuantizationLayout,
+    deserialize_layout,
+    deserialize_quant_params,
+    serialize_layout,
+    serialize_quant_params,
 )
-from quench.quantize import QuantParams, UniformQuantizer
 from quench.transform import ChannelNormalizer, DeltaCoder, SparseEncoder
-
 
 _SEGMENT_HEADER = struct.Struct("<II")
 _CHUNK_COUNT_HEADER = struct.Struct("<I")
@@ -34,7 +45,11 @@ class CompressionStrategy(Protocol):
     strategy_id: int
     strategy_name: str
 
-    def encode(self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig) -> tuple[bytes, dict[str, Any]]:
+    def encode(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
         """Encode a tensor into a payload and serializable metadata."""
 
     def decode(
@@ -53,13 +68,14 @@ class BaseCompressionStrategy(ABC):
 
     def __init__(self) -> None:
         self._normalizer = ChannelNormalizer()
-        self._quantizer = UniformQuantizer()
         self._delta = DeltaCoder()
         self._sparse = SparseEncoder()
 
     @abstractmethod
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         """Encode *tensor* according to the strategy."""
 
@@ -72,14 +88,21 @@ class BaseCompressionStrategy(ABC):
     ) -> np.ndarray[Any, np.dtype[Any]]:
         """Decode *data* according to the strategy."""
 
-    def _encode_lossless(self, tensor: np.ndarray[Any, np.dtype[Any]]) -> tuple[bytes, dict[str, Any]]:
+    def _active_config(self, config: QuenchConfig | None) -> QuenchConfig:
+        return config or QuenchConfig()
+
+    def _encode_lossless(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
         """Encode original tensor bytes exactly for the lossless mode."""
         raw_bytes = np.ascontiguousarray(tensor).view(np.uint8)
-        payload, stream_metadata = self._encode_symbol_stream(raw_bytes)
+        payload, stream_metadata = self._encode_symbol_stream(raw_bytes, config=config)
         return payload, {
             "dtype": np.dtype(tensor.dtype).str,
-            "path": "lossless",
             "lossless": True,
+            "path": "lossless",
             "shape": list(tensor.shape),
             "stream": stream_metadata,
         }
@@ -88,10 +111,11 @@ class BaseCompressionStrategy(ABC):
         self,
         data: bytes,
         metadata: dict[str, Any],
+        config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[np.uint8]]:
         """Decode a lossless byte stream."""
         stream_metadata = self._require_mapping(metadata, "stream")
-        decoded = self._decode_symbol_stream(data, stream_metadata)
+        decoded = self._decode_symbol_stream(data, stream_metadata, config=config)
         dtype = np.dtype(str(metadata.get("dtype", "")))
         shape = tuple(int(dim) for dim in metadata.get("shape", []))
         raw = np.ascontiguousarray(decoded.astype(np.uint8, copy=False))
@@ -149,52 +173,91 @@ class BaseCompressionStrategy(ABC):
         *,
         bits: int,
         mode: QuantMode,
+        config: QuenchConfig,
+        default_axis: int = 0,
+        compact_1d: bool = False,
     ) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]]:
-        """Quantize values and serialize the quantization parameters."""
-        quantized, params = self._quantizer.quantize(tensor, bits=bits, mode=mode)
-        return quantized, self._quant_params_to_metadata(params)
+        """Quantize values using reusable quantizer/calibration components."""
+        values = np.asarray(tensor)
+        layout = self._resolve_layout(
+            config,
+            tensor_ndim=values.ndim,
+            default_axis=default_axis,
+            compact_1d=compact_1d,
+        )
+        quantizer = self._resolve_quantizer(layout)
+        calibrator = self._resolve_calibration_policy(config, layout)
+        params = calibrator.calibrate(values, bits=bits, mode=mode, layout=layout)
+        quantized = quantizer.quantize(values, params)
+        return quantized, {
+            "layout": serialize_layout(layout),
+            "params": serialize_quant_params(params),
+        }
 
     def _dequantize_tensor(
         self,
         quantized: np.ndarray[Any, np.dtype[Any]],
         metadata: dict[str, Any],
     ) -> np.ndarray[Any, np.dtype[Any]]:
-        """Reverse uniform quantization from explicit metadata."""
-        params = self._quant_params_from_metadata(metadata)
-        return self._quantizer.dequantize(quantized, params)
+        """Reverse quantization from explicit layout and parameter metadata."""
+        layout = deserialize_layout(self._require_mapping(metadata, "layout"))
+        params = deserialize_quant_params(self._require_mapping(metadata, "params"))
+        quantizer = self._resolve_quantizer(layout)
+        return quantizer.dequantize(quantized, params)
 
-    def _quant_params_to_metadata(self, params: QuantParams) -> dict[str, Any]:
-        """Convert :class:`QuantParams` into JSON-safe metadata."""
-        return {
-            "bits": params.bits,
-            "dtype_orig": params.dtype_orig,
-            "mode": int(params.mode),
-            "scale": params.scale,
-            "value_range_max": params.value_range_max,
-            "value_range_min": params.value_range_min,
-            "zero_point": params.zero_point,
-        }
+    def _resolve_layout(
+        self,
+        config: QuenchConfig,
+        *,
+        tensor_ndim: int,
+        default_axis: int,
+        compact_1d: bool = False,
+    ) -> QuantizationLayout:
+        granularity = config.quantization_granularity
+        if compact_1d and tensor_ndim <= 1:
+            granularity = QuantizationGranularity.PER_TENSOR
+        axis = default_axis if config.quantization_axis is None else config.quantization_axis
+        block_size = config.block_size if granularity == QuantizationGranularity.BLOCKWISE else None
+        return QuantizationLayout(granularity=granularity, axis=axis, block_size=block_size)
 
-    def _quant_params_from_metadata(self, metadata: dict[str, Any]) -> QuantParams:
-        """Reconstruct :class:`QuantParams` from metadata."""
-        try:
-            return QuantParams(
-                scale=float(metadata["scale"]),
-                zero_point=int(metadata["zero_point"]),
-                bits=int(metadata["bits"]),
-                mode=QuantMode(int(metadata["mode"])),
-                dtype_orig=str(metadata["dtype_orig"]),
-                value_range_min=float(metadata["value_range_min"]),
-                value_range_max=float(metadata["value_range_max"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise MalformedPayloadError(f"Malformed quantization metadata: {exc}") from exc
+    def _resolve_quantizer(self, layout: QuantizationLayout) -> Any:
+        if layout.granularity == QuantizationGranularity.PER_TENSOR:
+            return PerTensorQuantizer()
+        if layout.granularity == QuantizationGranularity.PER_CHANNEL:
+            return PerChannelQuantizer(axis=layout.axis)
+        if layout.granularity == QuantizationGranularity.BLOCKWISE:
+            return BlockwiseQuantizer(axis=layout.axis, block_size=int(layout.block_size or 0))
+        raise MalformedPayloadError(f"Unsupported quantization granularity: {layout.granularity.value}")
+
+    def _resolve_calibration_policy(
+        self,
+        config: QuenchConfig,
+        layout: QuantizationLayout,
+    ) -> Any:
+        if config.calibration_policy == CalibrationPolicyKind.MINMAX:
+            if layout.granularity == QuantizationGranularity.PER_TENSOR:
+                return PerTensorCalibrationPolicy()
+            if layout.granularity == QuantizationGranularity.PER_CHANNEL:
+                return PerChannelCalibrationPolicy()
+            return BlockwiseCalibrationPolicy()
+        if config.calibration_policy == CalibrationPolicyKind.PERCENTILE:
+            return PercentileCalibrationPolicy(percentile=config.percentile_value)
+        if config.calibration_policy == CalibrationPolicyKind.PER_CHANNEL:
+            return PerChannelCalibrationPolicy()
+        if config.calibration_policy == CalibrationPolicyKind.BLOCKWISE:
+            return BlockwiseCalibrationPolicy()
+        raise MalformedPayloadError(
+            f"Unsupported calibration policy: {config.calibration_policy.value!r}"
+        )
 
     def _encode_symbol_stream(
         self,
         symbols: np.ndarray[Any, np.dtype[Any]],
+        *,
+        config: QuenchConfig,
+        bits: int | None = None,
     ) -> tuple[bytes, dict[str, Any]]:
-        """Encode integer symbols using rANS when practical, or raw bytes otherwise."""
+        """Encode integer symbols with backend-dispatched entropy or bit packing."""
         array = np.ascontiguousarray(symbols)
         metadata: dict[str, Any] = {
             "dtype": array.dtype.str,
@@ -205,9 +268,32 @@ class BaseCompressionStrategy(ABC):
             metadata["encoding"] = "empty"
             return b"", metadata
 
+        if (
+            bits is not None
+            and config.pack_bits
+            and np.issubdtype(array.dtype, np.integer)
+            and bits < array.dtype.itemsize * 8
+        ):
+            backend = get_packing_backend(config.packing_backend)
+            packed = backend.pack_bits(
+                array,
+                bits=bits,
+                signed=bool(np.issubdtype(array.dtype, np.signedinteger)),
+                layout_metadata={"dtype": array.dtype.str},
+            )
+            metadata.update(
+                {
+                    "bits": bits,
+                    "encoding": "packed",
+                    "signed": bool(np.issubdtype(array.dtype, np.signedinteger)),
+                }
+            )
+            return packed, metadata
+
         unique = np.unique(array)
         if (
-            unique.size <= SCALE
+            config.entropy_coder == "rans"
+            and unique.size <= SCALE
             and np.issubdtype(array.dtype, np.integer)
             and int(np.min(unique)) >= np.iinfo(np.int32).min
             and int(np.max(unique)) <= np.iinfo(np.int32).max
@@ -215,8 +301,9 @@ class BaseCompressionStrategy(ABC):
             flat = array.reshape(-1).astype(np.int64, copy=False)
             freq_table = normalize_freq_table(build_freq_table(flat))
             if sum(freq_table.values()) == SCALE:
-                model_bytes = FrequencyModel.from_freq_table(freq_table).serialize()
-                encoded = RANSEncoder(freq_table).encode(flat)
+                model = FrequencyModel.from_freq_table(freq_table)
+                model_bytes = model.serialize()
+                encoded = get_entropy_backend(config.entropy_backend).encode_symbols(flat, model)
                 metadata["encoding"] = "rans"
                 return (
                     _SEGMENT_HEADER.pack(len(model_bytes), len(encoded))
@@ -231,8 +318,11 @@ class BaseCompressionStrategy(ABC):
         self,
         data: bytes,
         metadata: dict[str, Any],
+        *,
+        config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         """Decode a symbol stream encoded by :meth:`_encode_symbol_stream`."""
+        active_config = self._active_config(config)
         encoding = str(metadata.get("encoding", ""))
         dtype = np.dtype(str(metadata.get("dtype", "")))
         shape = tuple(int(dim) for dim in metadata.get("shape", []))
@@ -248,6 +338,15 @@ class BaseCompressionStrategy(ABC):
                     f"expected {expected_size}, got {len(data)}"
                 )
             return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+        if encoding == "packed":
+            backend = get_packing_backend(active_config.packing_backend)
+            return backend.unpack_bits(
+                data,
+                bits=int(metadata["bits"]),
+                signed=bool(metadata["signed"]),
+                shape=shape,
+                layout_metadata={"dtype": dtype.str},
+            )
         if encoding == "rans":
             if len(data) < _SEGMENT_HEADER.size:
                 raise MalformedPayloadError("Entropy segment is too short")
@@ -263,12 +362,19 @@ class BaseCompressionStrategy(ABC):
                     f"expected {encoded_end} bytes, got {len(data)}"
                 )
             model = FrequencyModel.deserialize(data[model_start:model_end])
-            decoded = RANSDecoder(model.freq_table).decode(data[model_end:encoded_end], count)
+            decoded = get_entropy_backend(active_config.entropy_backend).decode_symbols(
+                data[model_end:encoded_end],
+                model,
+                count,
+            )
             return decoded.astype(dtype, copy=False).reshape(shape)
         raise MalformedPayloadError(f"Unsupported symbol stream encoding: {encoding!r}")
 
     def _encode_sparse_indices(
-        self, indices: np.ndarray[Any, np.dtype[Any]]
+        self,
+        indices: np.ndarray[Any, np.dtype[Any]],
+        *,
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         """Encode monotonically increasing sparse indices as delta symbols."""
         working = np.asarray(indices, dtype=np.int64)
@@ -276,7 +382,7 @@ class BaseCompressionStrategy(ABC):
         if working.size:
             deltas[0] = working[0]
             deltas[1:] = np.diff(working)
-        payload, stream_metadata = self._encode_symbol_stream(deltas)
+        payload, stream_metadata = self._encode_symbol_stream(deltas, config=config)
         return payload, {
             "count": int(working.size),
             "stream": stream_metadata,
@@ -286,10 +392,15 @@ class BaseCompressionStrategy(ABC):
         self,
         data: bytes,
         metadata: dict[str, Any],
+        *,
+        config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[np.int64]]:
         """Decode sparse indices stored as delta symbols."""
         stream_metadata = self._require_mapping(metadata, "stream")
-        deltas = self._decode_symbol_stream(data, stream_metadata).astype(np.int64, copy=False)
+        deltas = self._decode_symbol_stream(data, stream_metadata, config=config).astype(
+            np.int64,
+            copy=False,
+        )
         if deltas.size == 0:
             return np.empty((0,), dtype=np.int64)
         return np.cumsum(deltas, dtype=np.int64)
@@ -341,6 +452,17 @@ class BaseCompressionStrategy(ABC):
             raise MalformedPayloadError(f"Metadata field {key!r} must be a mapping")
         return value
 
+    def _activation_quant_mode(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        requested_mode: QuantMode,
+    ) -> QuantMode:
+        """Prefer asymmetric quantization for non-negative tensors."""
+        values = np.asarray(tensor)
+        if requested_mode == QuantMode.SYMMETRIC and values.size and float(np.min(values)) >= 0.0:
+            return QuantMode.ASYMMETRIC
+        return requested_mode
+
 
 class WeightStrategy(BaseCompressionStrategy):
     """Weight tensors: normalize, quantize, and entropy-code."""
@@ -350,10 +472,12 @@ class WeightStrategy(BaseCompressionStrategy):
     strategy_name = "weight"
 
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         if config.codec_mode == CodecMode.LOSSLESS or config.quant_mode == QuantMode.NONE:
-            return self._encode_lossless(tensor)
+            return self._encode_lossless(tensor, config)
 
         normalized, normalization_metadata = self._normalize_tensor(
             tensor,
@@ -364,8 +488,14 @@ class WeightStrategy(BaseCompressionStrategy):
             normalized,
             bits=config.target_bits,
             mode=config.quant_mode,
+            config=config,
+            default_axis=0,
         )
-        payload, stream_metadata = self._encode_symbol_stream(quantized)
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
         return payload, {
             "lossless": False,
             "normalization": normalization_metadata,
@@ -381,10 +511,10 @@ class WeightStrategy(BaseCompressionStrategy):
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         if metadata.get("lossless") is True:
-            return self._decode_lossless(data, metadata)
+            return self._decode_lossless(data, metadata, config)
 
         stream_metadata = self._require_mapping(metadata, "stream")
-        quantized = self._decode_symbol_stream(data, stream_metadata)
+        quantized = self._decode_symbol_stream(data, stream_metadata, config=config)
         restored = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
         return self._denormalize_tensor(restored, self._require_mapping(metadata, "normalization"))
 
@@ -397,16 +527,23 @@ class KVCacheStrategy(BaseCompressionStrategy):
     strategy_name = "kv_cache"
 
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         if config.codec_mode == CodecMode.LOSSLESS or config.quant_mode == QuantMode.NONE:
-            return self._encode_lossless(tensor)
+            return self._encode_lossless(tensor, config)
 
-        delta_axis = self._choose_delta_axis(tensor)
-        deltas, anchor = self._delta.encode(tensor, axis=delta_axis)
+        delta_metadata: dict[str, Any] | None = None
+        working = np.asarray(tensor)
+        if config.delta_coding and working.ndim > 1:
+            delta_axis = self._choose_delta_axis(working)
+            working, anchor = self._delta.encode(working, axis=delta_axis)
+            delta_metadata = {"anchor": anchor, "axis": delta_axis}
+
         normalized, normalization_metadata = self._normalize_tensor(
-            deltas,
-            axis=max(deltas.ndim - 1, 0),
+            working,
+            axis=max(working.ndim - 1, 0),
             per_channel=config.per_channel,
         )
         bits = min(config.target_bits + 1, 8)
@@ -414,11 +551,12 @@ class KVCacheStrategy(BaseCompressionStrategy):
             normalized,
             bits=bits,
             mode=config.quant_mode,
+            config=config,
+            default_axis=max(working.ndim - 1, 0),
         )
-        payload, stream_metadata = self._encode_symbol_stream(quantized)
+        payload, stream_metadata = self._encode_symbol_stream(quantized, config=config, bits=bits)
         return payload, {
-            "anchor": anchor,
-            "delta": {"axis": delta_axis},
+            "delta": delta_metadata,
             "lossless": False,
             "normalization": normalization_metadata,
             "path": "dense",
@@ -433,14 +571,20 @@ class KVCacheStrategy(BaseCompressionStrategy):
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         if metadata.get("lossless") is True:
-            return self._decode_lossless(data, metadata)
+            return self._decode_lossless(data, metadata, config)
 
-        quantized = self._decode_symbol_stream(data, self._require_mapping(metadata, "stream"))
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
         normalized = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
-        deltas = self._denormalize_tensor(normalized, self._require_mapping(metadata, "normalization"))
-        delta_metadata = self._require_mapping(metadata, "delta")
-        anchor = np.asarray(metadata.get("anchor"))
-        return self._delta.decode(deltas, anchor, axis=int(delta_metadata["axis"]))
+        restored = self._denormalize_tensor(normalized, self._require_mapping(metadata, "normalization"))
+        delta_metadata = metadata.get("delta")
+        if isinstance(delta_metadata, dict):
+            anchor = np.asarray(delta_metadata.get("anchor"))
+            return self._delta.decode(restored, anchor, axis=int(delta_metadata["axis"]))
+        return restored
 
     def _choose_delta_axis(self, tensor: np.ndarray[Any, np.dtype[Any]]) -> int:
         """Pick the longest non-feature axis for cache delta coding."""
@@ -459,10 +603,12 @@ class EmbeddingStrategy(BaseCompressionStrategy):
     strategy_name = "embedding"
 
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         if config.codec_mode == CodecMode.LOSSLESS or config.quant_mode == QuantMode.NONE:
-            return self._encode_lossless(tensor)
+            return self._encode_lossless(tensor, config)
 
         if self._should_use_sparse(tensor, threshold=0.30):
             return self._encode_sparse(tensor, config)
@@ -476,8 +622,14 @@ class EmbeddingStrategy(BaseCompressionStrategy):
             normalized,
             bits=config.target_bits,
             mode=config.quant_mode,
+            config=config,
+            default_axis=0,
         )
-        payload, stream_metadata = self._encode_symbol_stream(quantized)
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
         return payload, {
             "lossless": False,
             "normalization": normalization_metadata,
@@ -493,11 +645,15 @@ class EmbeddingStrategy(BaseCompressionStrategy):
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         if metadata.get("lossless") is True:
-            return self._decode_lossless(data, metadata)
+            return self._decode_lossless(data, metadata, config)
         if metadata.get("path") == "sparse":
-            return self._decode_sparse(data, metadata)
+            return self._decode_sparse(data, metadata, config)
 
-        quantized = self._decode_symbol_stream(data, self._require_mapping(metadata, "stream"))
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
         normalized = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
         return self._denormalize_tensor(normalized, self._require_mapping(metadata, "normalization"))
 
@@ -508,7 +664,7 @@ class EmbeddingStrategy(BaseCompressionStrategy):
     ) -> tuple[bytes, dict[str, Any]]:
         """Encode sparse embeddings by storing indices separately."""
         sparse = self._sparse.encode(tensor, threshold=0.0)
-        index_payload, index_metadata = self._encode_sparse_indices(sparse.indices)
+        index_payload, index_metadata = self._encode_sparse_indices(sparse.indices, config=config)
 
         if sparse.nnz == 0:
             value_payload = b""
@@ -526,8 +682,15 @@ class EmbeddingStrategy(BaseCompressionStrategy):
                 normalized_values.reshape(-1),
                 bits=config.target_bits,
                 mode=config.quant_mode,
+                config=config,
+                default_axis=0,
+                compact_1d=True,
             )
-            value_payload, value_metadata = self._encode_symbol_stream(quantized_values)
+            value_payload, value_metadata = self._encode_symbol_stream(
+                quantized_values,
+                config=config,
+                bits=config.target_bits,
+            )
 
         payload = self._pack_chunks([index_payload, value_payload])
         metadata = {
@@ -546,12 +709,17 @@ class EmbeddingStrategy(BaseCompressionStrategy):
         self,
         data: bytes,
         metadata: dict[str, Any],
+        config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[np.float32]]:
         """Decode sparse embedding payloads."""
         shape = tuple(int(dim) for dim in metadata.get("shape", []))
         size = int(np.prod(shape, dtype=np.int64))
         chunks = self._unpack_chunks(data, expected_count=2)
-        indices = self._decode_sparse_indices(chunks[0], self._require_mapping(metadata, "index_stream"))
+        indices = self._decode_sparse_indices(
+            chunks[0],
+            self._require_mapping(metadata, "index_stream"),
+            config=config,
+        )
 
         dense = np.zeros(size, dtype=np.float32)
         if int(metadata.get("nnz", 0)) == 0:
@@ -560,7 +728,7 @@ class EmbeddingStrategy(BaseCompressionStrategy):
         quantization_metadata = self._require_mapping(metadata, "quantization")
         normalization_metadata = self._require_mapping(metadata, "normalization")
         value_stream = self._require_mapping(metadata, "value_stream")
-        quantized_values = self._decode_symbol_stream(chunks[1], value_stream)
+        quantized_values = self._decode_symbol_stream(chunks[1], value_stream, config=config)
         normalized_values = self._dequantize_tensor(quantized_values, quantization_metadata)
         restored_values = self._denormalize_tensor(
             normalized_values.reshape(1, -1),
@@ -592,10 +760,12 @@ class ActivationStrategy(BaseCompressionStrategy):
     strategy_name = "activation"
 
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
         if config.codec_mode == CodecMode.LOSSLESS or config.quant_mode == QuantMode.NONE:
-            return self._encode_lossless(tensor)
+            return self._encode_lossless(tensor, config)
 
         if self._should_use_sparse(tensor, threshold=0.75):
             return self._encode_sparse(tensor, config)
@@ -606,8 +776,10 @@ class ActivationStrategy(BaseCompressionStrategy):
             tensor,
             bits=bits,
             mode=quant_mode,
+            config=config,
+            default_axis=max(np.asarray(tensor).ndim - 1, 0),
         )
-        payload, stream_metadata = self._encode_symbol_stream(quantized)
+        payload, stream_metadata = self._encode_symbol_stream(quantized, config=config, bits=bits)
         return payload, {
             "lossless": False,
             "path": "dense",
@@ -622,11 +794,15 @@ class ActivationStrategy(BaseCompressionStrategy):
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         if metadata.get("lossless") is True:
-            return self._decode_lossless(data, metadata)
+            return self._decode_lossless(data, metadata, config)
         if metadata.get("path") == "sparse":
-            return self._decode_sparse(data, metadata)
+            return self._decode_sparse(data, metadata, config)
 
-        quantized = self._decode_symbol_stream(data, self._require_mapping(metadata, "stream"))
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
         return self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
 
     def _encode_sparse(
@@ -636,7 +812,7 @@ class ActivationStrategy(BaseCompressionStrategy):
     ) -> tuple[bytes, dict[str, Any]]:
         """Encode sparse activations by storing non-zero values and indices."""
         sparse = self._sparse.encode(tensor, threshold=0.0)
-        index_payload, index_metadata = self._encode_sparse_indices(sparse.indices)
+        index_payload, index_metadata = self._encode_sparse_indices(sparse.indices, config=config)
 
         if sparse.nnz == 0:
             value_payload = b""
@@ -646,14 +822,21 @@ class ActivationStrategy(BaseCompressionStrategy):
             quant_mode = self._activation_quant_mode(sparse.values, config.quant_mode)
             bits = min(config.target_bits + 1, 8)
             quantized_values, quant_metadata = self._quantize_tensor(
-                sparse.values.astype(np.float32, copy=False),
+                sparse.values,
                 bits=bits,
                 mode=quant_mode,
+                config=config,
+                default_axis=0,
+                compact_1d=True,
             )
-            value_payload, value_metadata = self._encode_symbol_stream(quantized_values)
+            value_payload, value_metadata = self._encode_symbol_stream(
+                quantized_values,
+                config=config,
+                bits=bits,
+            )
 
         payload = self._pack_chunks([index_payload, value_payload])
-        return payload, {
+        metadata = {
             "index_stream": index_metadata,
             "lossless": False,
             "nnz": sparse.nnz,
@@ -662,24 +845,30 @@ class ActivationStrategy(BaseCompressionStrategy):
             "shape": list(tensor.shape),
             "value_stream": value_metadata,
         }
+        return payload, metadata
 
     def _decode_sparse(
         self,
         data: bytes,
         metadata: dict[str, Any],
+        config: QuenchConfig | None,
     ) -> np.ndarray[Any, np.dtype[np.float32]]:
         """Decode sparse activation payloads."""
         shape = tuple(int(dim) for dim in metadata.get("shape", []))
         size = int(np.prod(shape, dtype=np.int64))
         chunks = self._unpack_chunks(data, expected_count=2)
-        indices = self._decode_sparse_indices(chunks[0], self._require_mapping(metadata, "index_stream"))
+        indices = self._decode_sparse_indices(
+            chunks[0],
+            self._require_mapping(metadata, "index_stream"),
+            config=config,
+        )
 
         dense = np.zeros(size, dtype=np.float32)
         if int(metadata.get("nnz", 0)) == 0:
             return dense.reshape(shape)
 
         value_stream = self._require_mapping(metadata, "value_stream")
-        quantized_values = self._decode_symbol_stream(chunks[1], value_stream)
+        quantized_values = self._decode_symbol_stream(chunks[1], value_stream, config=config)
         values = self._dequantize_tensor(quantized_values, self._require_mapping(metadata, "quantization"))
         dense[indices.astype(np.intp, copy=False)] = values.astype(np.float32, copy=False)
         return dense.reshape(shape)
@@ -697,16 +886,207 @@ class ActivationStrategy(BaseCompressionStrategy):
         zero_fraction = float(np.count_nonzero(values == 0) / values.size)
         return zero_fraction >= threshold
 
-    def _activation_quant_mode(
+
+class OptimizerStateStrategy(BaseCompressionStrategy):
+    """Optimizer state tensors favour delta-friendly transforms and robust quantization."""
+
+    tensor_type = TensorType.OPTIMIZER_STATE
+    strategy_id = 5
+    strategy_name = "optimizer_state"
+
+    def encode(
         self,
         tensor: np.ndarray[Any, np.dtype[Any]],
-        requested_mode: QuantMode,
-    ) -> QuantMode:
-        """Prefer asymmetric quantization for non-negative activations."""
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
         values = np.asarray(tensor)
-        if requested_mode == QuantMode.SYMMETRIC and values.size and float(np.min(values)) >= 0.0:
-            return QuantMode.ASYMMETRIC
-        return requested_mode
+        if (
+            config.codec_mode == CodecMode.LOSSLESS
+            or config.quant_mode == QuantMode.NONE
+            or np.issubdtype(values.dtype, np.integer)
+        ):
+            return self._encode_lossless(values, config)
+
+        delta_metadata: dict[str, Any] | None = None
+        working = values.astype(np.float32, copy=False)
+        if config.delta_coding and working.ndim > 1:
+            axis = self._choose_delta_axis(working)
+            working, anchor = self._delta.encode(working, axis=axis)
+            delta_metadata = {"anchor": anchor, "axis": axis}
+
+        normalized, normalization_metadata = self._normalize_tensor(
+            working,
+            axis=0,
+            per_channel=config.per_channel and working.ndim > 1,
+        )
+        quant_mode = self._activation_quant_mode(working, config.quant_mode)
+        quantized, quant_metadata = self._quantize_tensor(
+            normalized,
+            bits=config.target_bits,
+            mode=quant_mode,
+            config=config,
+            default_axis=0,
+            compact_1d=working.ndim <= 1,
+        )
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
+        return payload, {
+            "delta": delta_metadata,
+            "lossless": False,
+            "normalization": normalization_metadata,
+            "path": "dense",
+            "quantization": quant_metadata,
+            "stream": stream_metadata,
+        }
+
+    def decode(
+        self,
+        data: bytes,
+        metadata: dict[str, Any],
+        config: QuenchConfig | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        if metadata.get("lossless") is True:
+            return self._decode_lossless(data, metadata, config)
+
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
+        normalized = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
+        restored = self._denormalize_tensor(normalized, self._require_mapping(metadata, "normalization"))
+        delta_metadata = metadata.get("delta")
+        if isinstance(delta_metadata, dict):
+            anchor = np.asarray(delta_metadata.get("anchor"))
+            return self._delta.decode(restored, anchor, axis=int(delta_metadata["axis"]))
+        return restored
+
+    def _choose_delta_axis(self, tensor: np.ndarray[Any, np.dtype[Any]]) -> int:
+        if tensor.ndim <= 1:
+            return 0
+        return max(range(tensor.ndim), key=lambda axis: int(tensor.shape[axis]))
+
+
+class BiasStrategy(BaseCompressionStrategy):
+    """Bias tensors use a compact direct quantization path to limit metadata overhead."""
+
+    tensor_type = TensorType.BIAS
+    strategy_id = 6
+    strategy_name = "bias"
+
+    def encode(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
+        values = np.asarray(tensor)
+        if (
+            config.codec_mode == CodecMode.LOSSLESS
+            or config.quant_mode == QuantMode.NONE
+            or np.issubdtype(values.dtype, np.integer)
+        ):
+            return self._encode_lossless(values, config)
+
+        quantized, quant_metadata = self._quantize_tensor(
+            values.astype(np.float32, copy=False),
+            bits=config.target_bits,
+            mode=self._activation_quant_mode(values, config.quant_mode),
+            config=config,
+            default_axis=0,
+            compact_1d=True,
+        )
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
+        return payload, {
+            "lossless": False,
+            "path": "compact",
+            "quantization": quant_metadata,
+            "stream": stream_metadata,
+        }
+
+    def decode(
+        self,
+        data: bytes,
+        metadata: dict[str, Any],
+        config: QuenchConfig | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        if metadata.get("lossless") is True:
+            return self._decode_lossless(data, metadata, config)
+
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
+        return self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
+
+
+class MixedPrecisionStrategy(BaseCompressionStrategy):
+    """Mixed-precision tensors preserve dtype semantics while using safe quantization paths."""
+
+    tensor_type = TensorType.MIXED_PRECISION
+    strategy_id = 7
+    strategy_name = "mixed_precision"
+
+    def encode(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
+        values = np.asarray(tensor)
+        if (
+            config.codec_mode == CodecMode.LOSSLESS
+            or config.quant_mode == QuantMode.NONE
+            or np.issubdtype(values.dtype, np.integer)
+        ):
+            return self._encode_lossless(values, config)
+
+        working = values.astype(np.float32, copy=False)
+        quant_mode = self._activation_quant_mode(working, config.quant_mode)
+        quantized, quant_metadata = self._quantize_tensor(
+            working,
+            bits=config.target_bits,
+            mode=quant_mode,
+            config=config,
+            default_axis=max(working.ndim - 1, 0),
+            compact_1d=working.ndim <= 1,
+        )
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
+        return payload, {
+            "lossless": False,
+            "original_dtype": values.dtype.str,
+            "path": "mixed_precision",
+            "quantization": quant_metadata,
+            "stream": stream_metadata,
+        }
+
+    def decode(
+        self,
+        data: bytes,
+        metadata: dict[str, Any],
+        config: QuenchConfig | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        if metadata.get("lossless") is True:
+            return self._decode_lossless(data, metadata, config)
+
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
+        restored = self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
+        dtype_str = str(metadata.get("original_dtype", restored.dtype.str))
+        return restored.astype(np.dtype(dtype_str), copy=False)
 
 
 class DefaultStrategy(BaseCompressionStrategy):
@@ -717,17 +1097,31 @@ class DefaultStrategy(BaseCompressionStrategy):
     strategy_name = "default"
 
     def encode(
-        self, tensor: np.ndarray[Any, np.dtype[Any]], config: QuenchConfig
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
     ) -> tuple[bytes, dict[str, Any]]:
-        if config.codec_mode == CodecMode.LOSSLESS or config.quant_mode == QuantMode.NONE:
-            return self._encode_lossless(tensor)
+        values = np.asarray(tensor)
+        if (
+            config.codec_mode == CodecMode.LOSSLESS
+            or config.quant_mode == QuantMode.NONE
+            or np.issubdtype(values.dtype, np.integer)
+        ):
+            return self._encode_lossless(values, config)
 
         quantized, quant_metadata = self._quantize_tensor(
-            tensor,
+            values.astype(np.float32, copy=False),
             bits=config.target_bits,
-            mode=config.quant_mode,
+            mode=self._activation_quant_mode(values, config.quant_mode),
+            config=config,
+            default_axis=max(values.ndim - 1, 0),
+            compact_1d=values.ndim <= 1,
         )
-        payload, stream_metadata = self._encode_symbol_stream(quantized)
+        payload, stream_metadata = self._encode_symbol_stream(
+            quantized,
+            config=config,
+            bits=config.target_bits,
+        )
         return payload, {
             "lossless": False,
             "path": "dense",
@@ -742,9 +1136,13 @@ class DefaultStrategy(BaseCompressionStrategy):
         config: QuenchConfig | None = None,
     ) -> np.ndarray[Any, np.dtype[Any]]:
         if metadata.get("lossless") is True:
-            return self._decode_lossless(data, metadata)
+            return self._decode_lossless(data, metadata, config)
 
-        quantized = self._decode_symbol_stream(data, self._require_mapping(metadata, "stream"))
+        quantized = self._decode_symbol_stream(
+            data,
+            self._require_mapping(metadata, "stream"),
+            config=config,
+        )
         return self._dequantize_tensor(quantized, self._require_mapping(metadata, "quantization"))
 
 
@@ -752,6 +1150,9 @@ WEIGHT_STRATEGY = WeightStrategy()
 KV_CACHE_STRATEGY = KVCacheStrategy()
 EMBEDDING_STRATEGY = EmbeddingStrategy()
 ACTIVATION_STRATEGY = ActivationStrategy()
+OPTIMIZER_STATE_STRATEGY = OptimizerStateStrategy()
+BIAS_STRATEGY = BiasStrategy()
+MIXED_PRECISION_STRATEGY = MixedPrecisionStrategy()
 DEFAULT_STRATEGY = DefaultStrategy()
 
 STRATEGY_REGISTRY: dict[TensorType, CompressionStrategy] = {
@@ -759,6 +1160,9 @@ STRATEGY_REGISTRY: dict[TensorType, CompressionStrategy] = {
     TensorType.KV_CACHE: KV_CACHE_STRATEGY,
     TensorType.EMBEDDING: EMBEDDING_STRATEGY,
     TensorType.ACTIVATION: ACTIVATION_STRATEGY,
+    TensorType.OPTIMIZER_STATE: OPTIMIZER_STATE_STRATEGY,
+    TensorType.BIAS: BIAS_STRATEGY,
+    TensorType.MIXED_PRECISION: MIXED_PRECISION_STRATEGY,
 }
 
 STRATEGY_ID_REGISTRY: dict[int, CompressionStrategy] = {
@@ -766,6 +1170,9 @@ STRATEGY_ID_REGISTRY: dict[int, CompressionStrategy] = {
     KV_CACHE_STRATEGY.strategy_id: KV_CACHE_STRATEGY,
     EMBEDDING_STRATEGY.strategy_id: EMBEDDING_STRATEGY,
     ACTIVATION_STRATEGY.strategy_id: ACTIVATION_STRATEGY,
+    OPTIMIZER_STATE_STRATEGY.strategy_id: OPTIMIZER_STATE_STRATEGY,
+    BIAS_STRATEGY.strategy_id: BIAS_STRATEGY,
+    MIXED_PRECISION_STRATEGY.strategy_id: MIXED_PRECISION_STRATEGY,
     DEFAULT_STRATEGY.strategy_id: DEFAULT_STRATEGY,
 }
 

@@ -35,6 +35,15 @@ class TensorTypeDetector:
 
         lower_name = (name or "").lower()
 
+        if self._looks_like_optimizer_state(lower_name):
+            return TensorType.OPTIMIZER_STATE
+
+        if self._looks_like_bias(values, lower_name):
+            return TensorType.BIAS
+
+        if self._is_mixed_precision_dtype(values):
+            return TensorType.MIXED_PRECISION
+
         if self._contains_any(lower_name, ("embed",)):
             return TensorType.EMBEDDING
 
@@ -58,6 +67,46 @@ class TensorTypeDetector:
             return TensorType.ACTIVATION
 
         return TensorType.UNKNOWN
+
+    @staticmethod
+    def _looks_like_optimizer_state(name: str) -> bool:
+        """Heuristics for optimizer statistics and accumulator tensors."""
+        return any(
+            needle in name
+            for needle in (
+                "exp_avg",
+                "exp_avg_sq",
+                "adam",
+                "momentum",
+                "moments",
+                "state",
+                "optimizer",
+                "velocity",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_bias(
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        name: str,
+    ) -> bool:
+        """Bias tensors are usually small 1D arrays with explicit names."""
+        values = np.asarray(tensor)
+        if "bias" in name:
+            return True
+        return values.ndim == 1 and values.size <= 8_192
+
+    @staticmethod
+    def _is_mixed_precision_dtype(tensor: np.ndarray[Any, np.dtype[Any]]) -> bool:
+        """Detect explicit mixed-precision and integer edge-case tensors."""
+        dtype = np.asarray(tensor).dtype
+        if np.issubdtype(dtype, np.bool_):
+            return True
+        if np.issubdtype(dtype, np.integer):
+            return True
+        if np.issubdtype(dtype, np.floating):
+            return dtype != np.dtype(np.float32)
+        return True
 
     @staticmethod
     def _contains_any(name: str, needles: tuple[str, ...]) -> bool:

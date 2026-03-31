@@ -18,6 +18,8 @@ class TensorType(IntEnum):
     ACTIVATION = 3
     OPTIMIZER_STATE = 4
     UNKNOWN = 5
+    BIAS = 6
+    MIXED_PRECISION = 7
 
 
 class QuantMode(IntEnum):

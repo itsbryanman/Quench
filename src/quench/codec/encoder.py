@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import zlib
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -43,39 +43,35 @@ class QuenchEncoder:
         config: QuenchConfig | None = None,
     ) -> dict[str, CompressedTensor]:
         """Encode a state-dict-like mapping deterministically."""
+        return {
+            name: compressed
+            for name, compressed in self.iter_encode_dict(tensors, config=config)
+        }
+
+    def iter_encode_dict(
+        self,
+        tensors: dict[str, np.ndarray[Any, np.dtype[Any]] | "torch.Tensor"],
+        config: QuenchConfig | None = None,
+    ) -> Iterator[tuple[str, CompressedTensor]]:
+        """Encode a state-dict-like mapping one tensor at a time."""
         active_config = config or self._config
         numpy_tensors = {name: self._to_numpy(value) for name, value in tensors.items()}
-        encoded: dict[str, CompressedTensor] = {}
 
-        if (
-            len(numpy_tensors) > 1
-            and active_config.codec_mode == CodecMode.LOSSY
-            and 2 <= active_config.target_bits <= 8
-        ):
-            allocation = self._allocator.allocate_bits(
-                numpy_tensors,
-                total_budget_bits=active_config.target_bits * len(numpy_tensors),
-            )
-            lower_bound = max(2, active_config.target_bits - 1)
-            allocation = {
-                name: max(bits, lower_bound)
-                for name, bits in allocation.items()
-            }
-        else:
-            allocation = {}
+        allocation = self._resolve_bit_allocation(numpy_tensors, active_config)
 
         for name in sorted(numpy_tensors):
             tensor_config = active_config
             if name in allocation:
                 tensor_config = active_config.model_copy(update={"target_bits": allocation[name]})
-            encoded[name] = self._encode_numpy(
-                numpy_tensors[name],
-                tensor_type=None,
-                name=name,
-                config=tensor_config,
+            yield (
+                name,
+                self._encode_numpy(
+                    numpy_tensors[name],
+                    tensor_type=None,
+                    name=name,
+                    config=tensor_config,
+                ),
             )
-
-        return encoded
 
     def _encode_numpy(
         self,
@@ -139,3 +135,22 @@ class QuenchEncoder:
         """Compute a stable checksum from the original tensor bytes."""
         raw = np.ascontiguousarray(tensor).view(np.uint8)
         return int(zlib.crc32(raw) & 0xFFFFFFFF)
+
+    def _resolve_bit_allocation(
+        self,
+        tensors: dict[str, np.ndarray[Any, np.dtype[Any]]],
+        config: QuenchConfig,
+    ) -> dict[str, int]:
+        """Allocate bits across a bundle when the active config allows it."""
+        if (
+            len(tensors) > 1
+            and config.codec_mode == CodecMode.LOSSY
+            and 2 <= config.target_bits <= 8
+        ):
+            allocation = self._allocator.allocate_bits(
+                tensors,
+                total_budget_bits=config.target_bits * len(tensors),
+            )
+            lower_bound = max(2, config.target_bits - 1)
+            return {name: max(bits, lower_bound) for name, bits in allocation.items()}
+        return {}
