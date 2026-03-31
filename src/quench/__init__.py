@@ -1,11 +1,13 @@
 """Quench — format-aware compression codec for ML tensors."""
 from __future__ import annotations
 
-from typing import Any
-
-import numpy as np
-
 from quench.analyze import TensorProfiler, TensorTypeDetector
+from quench.codec import (
+    QuenchDecoder,
+    QuenchEncoder,
+    auto_compress,
+    auto_decompress,
+)
 from quench.core.config import QuenchConfig
 from quench.core.types import CodecMode, CompressedTensor, QuantMode, TensorHeader, TensorType
 from quench.quantize import Calibrator, ImportanceAllocator, QuantParams, UniformQuantizer
@@ -22,27 +24,8 @@ from quench.transform import (
 
 __version__ = "0.1.0"
 
-
-def compress(tensor: np.ndarray[Any, np.dtype[Any]], **kwargs: Any) -> CompressedTensor:
-    """Compress a tensor.
-
-    Full codec pipeline coming in Phase 3.
-    Use ``quench.entropy`` for direct rANS encoding.
-    """
-    raise NotImplementedError(
-        "Full codec pipeline coming in Phase 3. Use quench.entropy for direct rANS encoding."
-    )
-
-
-def decompress(data: CompressedTensor, **kwargs: Any) -> np.ndarray[Any, np.dtype[Any]]:
-    """Decompress a tensor.
-
-    Full codec pipeline coming in Phase 3.
-    Use ``quench.entropy`` for direct rANS decoding.
-    """
-    raise NotImplementedError(
-        "Full codec pipeline coming in Phase 3. Use quench.entropy for direct rANS decoding."
-    )
+compress = auto_compress
+decompress = auto_decompress
 
 
 __all__ = [
@@ -56,6 +39,8 @@ __all__ = [
     "PCATransform",
     "QuantParams",
     "QuenchConfig",
+    "QuenchDecoder",
+    "QuenchEncoder",
     "QuantMode",
     "SparseEncoder",
     "SparseRepresentation",
