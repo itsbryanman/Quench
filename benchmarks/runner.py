@@ -6,11 +6,19 @@ import tempfile
 import time
 from pathlib import Path
 from statistics import median
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from benchmarks.reporting import BenchmarkResult, RegressionThresholds, compare_reports, write_csv_report, write_json_report
+from benchmarks.real_models import LocalModelSpec, run_real_model_suite
+from benchmarks.reporting import (
+    BenchmarkResult,
+    RegressionThresholds,
+    build_aggregates,
+    compare_reports,
+    write_csv_report,
+    write_json_report,
+)
 from benchmarks.suites import build_bundle_suite, build_tensor_suite
 from quench.codec import QuenchDecoder, QuenchEncoder
 from quench.core.config import QuenchConfig
@@ -23,25 +31,64 @@ def run_benchmark_suite(
     config: QuenchConfig | None = None,
     repeats: int = 3,
     seed: int = 2025,
+    suite: str = "synthetic",
+    real_model_specs: Iterable[LocalModelSpec] | None = None,
+    real_model_mode: str = "full",
+    sampled_extra_tensors: int = 16,
+    zstd_level: int = 3,
     compare_against: str | Path | None = None,
     thresholds: RegressionThresholds | None = None,
 ) -> tuple[Path, Path, list[BenchmarkResult], tuple[str, ...]]:
-    """Run the synthetic benchmark suite and emit JSON/CSV artifacts."""
+    """Run the configured benchmark suite and emit JSON/CSV artifacts."""
     active_config = config or QuenchConfig()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    results = [
-        *_run_tensor_cases(active_config, repeats=repeats, seed=seed),
-        *_run_bundle_cases(active_config, repeats=repeats, seed=seed),
-    ]
+    results: list[BenchmarkResult] = []
+    summary: dict[str, Any] = {}
+    if suite in {"synthetic", "all"}:
+        synthetic_results = [
+            *_run_tensor_cases(active_config, repeats=repeats, seed=seed),
+            *_run_bundle_cases(active_config, repeats=repeats, seed=seed),
+        ]
+        results.extend(synthetic_results)
+        summary["synthetic"] = {"rows": len(synthetic_results)}
+
+    if suite in {"real", "all"}:
+        if not real_model_specs:
+            raise ValueError("real benchmark suite requires at least one local model spec")
+        real_results, real_summary = run_real_model_suite(
+            real_model_specs,
+            config=active_config,
+            repeats=repeats,
+            zstd_level=zstd_level,
+            benchmark_mode=real_model_mode,
+            sample_seed=seed,
+            sampled_extra_tensors=sampled_extra_tensors,
+        )
+        results.extend(real_results)
+        summary["real_models"] = real_summary
+
+    if not results:
+        raise ValueError("No benchmark results were produced")
+
     json_path = output_path / "quench-benchmarks.json"
     csv_path = output_path / "quench-benchmarks.csv"
     config_json = json.dumps(active_config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     write_json_report(
         results,
         json_path,
-        run_metadata={"config": config_json, "repeats": repeats, "seed": seed},
+        run_metadata={
+            "config": config_json,
+            "repeats": repeats,
+            "seed": seed,
+            "suite": suite,
+            "real_model_mode": real_model_mode,
+            "sampled_extra_tensors": sampled_extra_tensors,
+            "zstd_level": zstd_level,
+        },
+        summary=summary,
+        aggregates=build_aggregates(results),
     )
     write_csv_report(results, csv_path)
 
@@ -71,7 +118,7 @@ def _run_tensor_cases(config: QuenchConfig, *, repeats: int, seed: int) -> list[
 
         raw_bytes = int(case.tensor.nbytes)
         compressed_bytes = int(compressed.compressed_nbytes)
-        mse, max_abs, relative_error = _error_metrics(case.tensor, restored)
+        mse, max_abs, relative_error, cosine_sim = _error_metrics(case.tensor, restored)
 
         results.append(
             BenchmarkResult(
@@ -90,6 +137,7 @@ def _run_tensor_cases(config: QuenchConfig, *, repeats: int, seed: int) -> list[
                 encode_throughput_bytes_per_sec=(raw_bytes / encode_seconds if encode_seconds else 0.0),
                 decode_throughput_bytes_per_sec=(raw_bytes / decode_seconds if decode_seconds else 0.0),
                 backend_name=config.entropy_backend,
+                cosine_similarity=cosine_sim,
             )
         )
 
@@ -114,7 +162,7 @@ def _run_bundle_cases(config: QuenchConfig, *, repeats: int, seed: int) -> list[
                 lambda: load_compressed(bundle_path, config=config),
                 repeats=repeats,
             )
-        mse, max_abs, relative_error = _bundle_error_metrics(case.tensors, restored)
+        mse, max_abs, relative_error, cosine_sim = _bundle_error_metrics(case.tensors, restored)
         results.append(
             BenchmarkResult(
                 benchmark_name=case.benchmark_name,
@@ -132,6 +180,7 @@ def _run_bundle_cases(config: QuenchConfig, *, repeats: int, seed: int) -> list[
                 encode_throughput_bytes_per_sec=(raw_bytes / encode_seconds if encode_seconds else 0.0),
                 decode_throughput_bytes_per_sec=(raw_bytes / decode_seconds if decode_seconds else 0.0),
                 backend_name=config.entropy_backend,
+                cosine_similarity=cosine_sim,
             )
         )
     return results
@@ -149,30 +198,36 @@ def _measure_seconds(fn: Callable[[], Any], *, repeats: int) -> float:
 def _error_metrics(
     original: np.ndarray[Any, np.dtype[Any]],
     restored: np.ndarray[Any, np.dtype[Any]],
-) -> tuple[float, float, float]:
-    orig = np.asarray(original, dtype=np.float64)
-    rec = np.asarray(restored, dtype=np.float64)
+) -> tuple[float, float, float, float]:
+    orig = np.asarray(original, dtype=np.float64).ravel()
+    rec = np.asarray(restored, dtype=np.float64).ravel()
     diff = rec - orig
     mse = float(np.mean(diff ** 2))
     max_abs = float(np.max(np.abs(diff)))
     denom = float(np.max(np.abs(orig))) or 1.0
     rel = max_abs / denom
-    return mse, max_abs, rel
+    dot = float(np.dot(orig, rec))
+    norm_orig = float(np.sqrt(np.dot(orig, orig)))
+    norm_rec = float(np.sqrt(np.dot(rec, rec)))
+    cosine_sim = dot / (norm_orig * norm_rec) if (norm_orig > 0 and norm_rec > 0) else 1.0
+    return mse, max_abs, rel, cosine_sim
 
 
 def _bundle_error_metrics(
     original: dict[str, np.ndarray[Any, np.dtype[Any]]],
     restored: dict[str, np.ndarray[Any, np.dtype[Any]]],
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     mses: list[float] = []
     maxes: list[float] = []
     relatives: list[float] = []
+    cosines: list[float] = []
     for name, tensor in original.items():
-        mse, max_abs, rel = _error_metrics(tensor, restored[name])
+        mse, max_abs, rel, cos = _error_metrics(tensor, restored[name])
         mses.append(mse)
         maxes.append(max_abs)
         relatives.append(rel)
-    return float(np.mean(mses)), float(np.max(maxes)), float(np.max(relatives))
+        cosines.append(cos)
+    return float(np.mean(mses)), float(np.max(maxes)), float(np.max(relatives)), float(np.min(cosines) if cosines else 1.0)
 
 
 def _load_results(path: str | Path) -> list[BenchmarkResult]:

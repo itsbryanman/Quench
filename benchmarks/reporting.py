@@ -6,12 +6,22 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from statistics import mean, median
+from typing import Any, Iterable, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CSV_FIELDS = [
     "benchmark_name",
+    "model_id",
+    "model_revision",
+    "model_local_path",
+    "source_file",
+    "source_file_sha256",
+    "benchmark_mode",
+    "sample_policy",
+    "was_sampled",
+    "tensor_role",
     "tensor_name",
     "tensor_type",
     "tensor_shape",
@@ -19,13 +29,23 @@ CSV_FIELDS = [
     "config",
     "raw_bytes",
     "compressed_bytes",
+    "zstd_raw_bytes",
+    "zstd_quantized_bytes",
+    "quantized_bytes",
+    "quench_payload_bytes",
+    "quench_metadata_bytes",
+    "quench_header_bytes",
     "compression_ratio",
+    "zstd_raw_ratio",
+    "zstd_quantized_ratio",
     "mse",
     "max_abs_error",
     "relative_error",
+    "cosine_similarity",
     "encode_throughput_bytes_per_sec",
     "decode_throughput_bytes_per_sec",
     "backend_name",
+    "source_dtype",
 ]
 
 
@@ -48,6 +68,25 @@ class BenchmarkResult:
     encode_throughput_bytes_per_sec: float
     decode_throughput_bytes_per_sec: float
     backend_name: str
+    model_id: str = ""
+    model_revision: str = ""
+    model_local_path: str = ""
+    source_file: str = ""
+    source_file_sha256: str = ""
+    benchmark_mode: str = ""
+    sample_policy: str = ""
+    was_sampled: bool = False
+    tensor_role: str = ""
+    zstd_raw_bytes: int | None = None
+    zstd_quantized_bytes: int | None = None
+    quantized_bytes: int | None = None
+    quench_payload_bytes: int | None = None
+    quench_metadata_bytes: int | None = None
+    quench_header_bytes: int | None = None
+    zstd_raw_ratio: float | None = None
+    zstd_quantized_ratio: float | None = None
+    cosine_similarity: float | None = None
+    source_dtype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,13 +111,18 @@ def write_json_report(
     path: str | Path,
     *,
     run_metadata: dict[str, Any] | None = None,
+    summary: dict[str, Any] | None = None,
+    aggregates: dict[str, Any] | None = None,
 ) -> None:
     """Write benchmark results as a stable JSON artifact."""
+    rows = [asdict(result) for result in results]
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "run_metadata": run_metadata or {},
         "schema_version": SCHEMA_VERSION,
-        "results": [asdict(result) for result in results],
+        "summary": summary or {},
+        "aggregates": aggregates or {},
+        "results": rows,
     }
     Path(path).write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -98,9 +142,33 @@ def write_csv_report(results: Iterable[BenchmarkResult], path: str | Path) -> No
 def load_json_report(path: str | Path) -> list[BenchmarkResult]:
     """Load benchmark results from a JSON artifact."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if int(payload["schema_version"]) != SCHEMA_VERSION:
+    schema_version = int(payload["schema_version"])
+    if schema_version not in {1, 2}:
         raise ValueError(f"Unsupported benchmark schema version: {payload['schema_version']}")
-    return [BenchmarkResult(**item) for item in payload["results"]]
+    valid_fields = {f.name for f in __import__("dataclasses").fields(BenchmarkResult)}
+    results = []
+    for item in payload["results"]:
+        filtered = {k: v for k, v in item.items() if k in valid_fields}
+        results.append(BenchmarkResult(**filtered))
+    return results
+
+
+def build_aggregates(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
+    """Build stable aggregate summaries for benchmark artifacts."""
+    rows = list(results)
+    return {
+        "by_model": _aggregate_groups(
+            rows,
+            key_fn=lambda item: (item.model_id or "synthetic", item.model_revision or ""),
+            labels=("model_id", "model_revision"),
+        ),
+        "by_tensor_type": _aggregate_groups(
+            rows,
+            key_fn=lambda item: (item.tensor_type,),
+            labels=("tensor_type",),
+        ),
+        "by_run": _aggregate_rows(rows),
+    }
 
 
 def compare_reports(
@@ -156,3 +224,131 @@ def compare_reports(
             )
 
     return RegressionReport(passed=not failures, messages=tuple(failures))
+
+
+def _aggregate_groups(
+    results: Sequence[BenchmarkResult],
+    *,
+    key_fn: Any,
+    labels: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, ...], list[BenchmarkResult]] = {}
+    for result in results:
+        key = tuple(str(part) for part in key_fn(result))
+        groups.setdefault(key, []).append(result)
+
+    aggregates: list[dict[str, Any]] = []
+    for key in sorted(groups):
+        aggregate = _aggregate_rows(groups[key])
+        for label, value in zip(labels, key):
+            aggregate[label] = value
+        aggregates.append(aggregate)
+    return aggregates
+
+
+def _aggregate_rows(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
+    rows = list(results)
+    raw_total = sum(item.raw_bytes for item in rows)
+    compressed_total = sum(item.compressed_bytes for item in rows)
+    zstd_raw_values = [item.zstd_raw_bytes for item in rows if item.zstd_raw_bytes is not None]
+    zstd_quantized_values = [item.zstd_quantized_bytes for item in rows if item.zstd_quantized_bytes is not None]
+    cosine_values = [item.cosine_similarity for item in rows if item.cosine_similarity is not None]
+    encoded = [item.encode_throughput_bytes_per_sec for item in rows]
+    decoded = [item.decode_throughput_bytes_per_sec for item in rows]
+    mse_values = [item.mse for item in rows]
+    max_abs_values = [item.max_abs_error for item in rows]
+    relative_values = [item.relative_error for item in rows]
+    metadata_overheads = [
+        (item.quench_metadata_bytes or 0) + (item.quench_header_bytes or 0)
+        for item in rows
+    ]
+    savings_vs_zstd_raw = [
+        item.zstd_raw_bytes - item.compressed_bytes
+        for item in rows
+        if item.zstd_raw_bytes is not None
+    ]
+    savings_vs_zstd_quantized = [
+        item.zstd_quantized_bytes - item.compressed_bytes
+        for item in rows
+        if item.zstd_quantized_bytes is not None
+    ]
+    pct_savings_vs_zstd_raw = [
+        (item.zstd_raw_bytes - item.compressed_bytes) / item.zstd_raw_bytes
+        for item in rows
+        if item.zstd_raw_bytes not in (None, 0)
+    ]
+    pct_savings_vs_zstd_quantized = [
+        (item.zstd_quantized_bytes - item.compressed_bytes) / item.zstd_quantized_bytes
+        for item in rows
+        if item.zstd_quantized_bytes not in (None, 0)
+    ]
+
+    return {
+        "rows": len(rows),
+        "raw_bytes_total": raw_total,
+        "compressed_bytes_total": compressed_total,
+        "zstd_raw_bytes_total": sum(zstd_raw_values) if zstd_raw_values else None,
+        "zstd_quantized_bytes_total": sum(zstd_quantized_values) if zstd_quantized_values else None,
+        "aggregate_compression_ratio": (raw_total / compressed_total if compressed_total else 0.0),
+        "aggregate_zstd_raw_ratio": (
+            raw_total / sum(zstd_raw_values) if zstd_raw_values and sum(zstd_raw_values) else None
+        ),
+        "aggregate_zstd_quantized_ratio": (
+            raw_total / sum(zstd_quantized_values)
+            if zstd_quantized_values and sum(zstd_quantized_values)
+            else None
+        ),
+        "mean_compression_ratio": mean(item.compression_ratio for item in rows) if rows else 0.0,
+        "median_compression_ratio": median(item.compression_ratio for item in rows) if rows else 0.0,
+        "mean_mse": mean(mse_values) if mse_values else 0.0,
+        "median_mse": median(mse_values) if mse_values else 0.0,
+        "max_abs_error_max": max(max_abs_values) if max_abs_values else 0.0,
+        "relative_error_max": max(relative_values) if relative_values else 0.0,
+        "mean_cosine_similarity": mean(cosine_values) if cosine_values else None,
+        "median_cosine_similarity": median(cosine_values) if cosine_values else None,
+        "p5_cosine_similarity": _percentile(cosine_values, 5.0) if cosine_values else None,
+        "mean_encode_throughput_bytes_per_sec": mean(encoded) if encoded else 0.0,
+        "median_encode_throughput_bytes_per_sec": median(encoded) if encoded else 0.0,
+        "mean_decode_throughput_bytes_per_sec": mean(decoded) if decoded else 0.0,
+        "median_decode_throughput_bytes_per_sec": median(decoded) if decoded else 0.0,
+        "mean_metadata_plus_header_bytes": mean(metadata_overheads) if metadata_overheads else 0.0,
+        "median_metadata_plus_header_bytes": median(metadata_overheads) if metadata_overheads else 0.0,
+        "wins_vs_zstd_raw": sum(1 for item in savings_vs_zstd_raw if item > 0),
+        "wins_vs_zstd_quantized": sum(1 for item in savings_vs_zstd_quantized if item > 0),
+        "mean_bytes_saved_vs_zstd_raw": mean(savings_vs_zstd_raw) if savings_vs_zstd_raw else None,
+        "median_bytes_saved_vs_zstd_raw": median(savings_vs_zstd_raw) if savings_vs_zstd_raw else None,
+        "mean_bytes_saved_vs_zstd_quantized": (
+            mean(savings_vs_zstd_quantized) if savings_vs_zstd_quantized else None
+        ),
+        "median_bytes_saved_vs_zstd_quantized": (
+            median(savings_vs_zstd_quantized) if savings_vs_zstd_quantized else None
+        ),
+        "mean_pct_saved_vs_zstd_raw": mean(pct_savings_vs_zstd_raw) if pct_savings_vs_zstd_raw else None,
+        "median_pct_saved_vs_zstd_raw": (
+            median(pct_savings_vs_zstd_raw) if pct_savings_vs_zstd_raw else None
+        ),
+        "mean_pct_saved_vs_zstd_quantized": (
+            mean(pct_savings_vs_zstd_quantized) if pct_savings_vs_zstd_quantized else None
+        ),
+        "median_pct_saved_vs_zstd_quantized": (
+            median(pct_savings_vs_zstd_quantized) if pct_savings_vs_zstd_quantized else None
+        ),
+    }
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    """Compute a deterministic percentile using linear interpolation."""
+    if not values:
+        raise ValueError("percentile requires at least one value")
+
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+
+    rank = (len(ordered) - 1) * (percentile / 100.0)
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    weight = rank - lower_index
+    lower = ordered[lower_index]
+    upper = ordered[upper_index]
+    return lower + (upper - lower) * weight

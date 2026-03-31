@@ -33,6 +33,12 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["torch>=2.0"]
+bench = [
+    "huggingface_hub>=0.30",
+    "safetensors>=0.4",
+    "zstandard>=0.22",
+    "torch>=2.0",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov",

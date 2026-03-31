@@ -6,6 +6,7 @@ from pathlib import Path
 from benchmarks.reporting import (
     BenchmarkResult,
     RegressionThresholds,
+    build_aggregates,
     compare_reports,
     load_json_report,
     write_csv_report,
@@ -38,13 +39,21 @@ def test_reporting_writes_json_and_csv(tmp_path: Path) -> None:
     json_path = tmp_path / "bench.json"
     csv_path = tmp_path / "bench.csv"
 
-    write_json_report(results, json_path)
+    write_json_report(
+        results,
+        json_path,
+        summary={"synthetic": {"rows": 1}},
+        aggregates={"by_run": {"rows": 1}},
+    )
     write_csv_report(results, csv_path)
 
     assert json_path.exists()
     assert csv_path.exists()
     loaded = load_json_report(json_path)
     assert loaded == results
+    payload = json_path.read_text(encoding="utf-8")
+    assert '"summary"' in payload
+    assert '"aggregates"' in payload
 
 
 def test_compare_reports_fails_on_regression() -> None:
@@ -63,3 +72,16 @@ def test_compare_reports_fails_on_regression() -> None:
 
     assert not report.passed
     assert report.messages
+
+
+def test_build_aggregates_tracks_cosine_similarity() -> None:
+    results = [
+        BenchmarkResult(**{**_result("tensor/a").__dict__, "cosine_similarity": 0.99}),
+        BenchmarkResult(**{**_result("tensor/b").__dict__, "cosine_similarity": 0.95}),
+    ]
+
+    aggregates = build_aggregates(results)
+
+    assert aggregates["by_run"]["mean_cosine_similarity"] == 0.97
+    assert aggregates["by_run"]["median_cosine_similarity"] == 0.97
+    assert aggregates["by_run"]["p5_cosine_similarity"] == 0.952

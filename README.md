@@ -68,6 +68,33 @@ Run the synthetic benchmark suite and emit machine-readable artifacts:
 python tools/run_benchmarks.py --output-dir benchmark-artifacts
 ```
 
+Download public Hugging Face safetensors snapshots and run the real-model suite:
+
+```bash
+HF_TOKEN=... python tools/download_models.py \
+  --output-dir benchmarks/models/public \
+  --model openai-community/gpt2 \
+  --model sentence-transformers/all-MiniLM-L6-v2
+
+python tools/run_benchmarks.py \
+  --output-dir benchmarks/artifacts/real-public-models \
+  --suite real \
+  --model-manifest benchmarks/models/public/model-download-manifest.json \
+  --real-model-mode full \
+  --repeats 1 \
+  --zstd-level 3
+
+python - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path("benchmarks/artifacts/real-public-models/quench-benchmarks.json").read_text())
+for row in payload["aggregates"]["by_model"]:
+    print(row["model_id"], row["compressed_bytes_total"], row["zstd_raw_bytes_total"], row["zstd_quantized_bytes_total"])
+PY
+```
+
+Use `--real-model-mode sampled` to benchmark a deterministic subset instead of every tensor. The sampled suite always includes embeddings, `lm_head`, attention projection weights, MLP projection weights, and a seeded extra sample from the remaining tensors.
+
 Artifacts:
 
 - `quench-benchmarks.json`: schema-versioned benchmark summary
@@ -78,7 +105,7 @@ Key fields include benchmark name, tensor type, shape, dtype, config JSON, raw b
 ## Install
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,bench]"
 ```
 
 ## Development

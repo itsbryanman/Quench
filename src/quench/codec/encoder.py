@@ -87,9 +87,19 @@ class QuenchEncoder:
             raise ValueError("Cannot encode an empty tensor")
 
         detected_type = tensor_type or self._detector.detect(values, name=name)
-        _ = self._profiler.profile(values)
+        effective_config = config
+        # Skip profiling for mask tensors — they may contain -inf which breaks histogram
+        if detected_type != TensorType.MASK:
+            _ = self._profiler.profile(values)
+
+        if self._should_force_lossless(values, name=name):
+            effective_config = config.model_copy(update={"codec_mode": CodecMode.LOSSLESS})
+
         strategy = get_strategy(detected_type)
-        payload, strategy_metadata = strategy.encode(values, config)
+        payload, strategy_metadata = strategy.encode(values, effective_config)
+        effective_codec_mode = (
+            CodecMode.LOSSLESS if strategy_metadata.get("lossless") is True else effective_config.codec_mode
+        )
 
         metadata = {
             "name": name,
@@ -109,7 +119,7 @@ class QuenchEncoder:
             tensor_type=detected_type,
             dtype=np.dtype(values.dtype).name,
             shape=tuple(int(dim) for dim in values.shape),
-            codec_mode=config.codec_mode,
+            codec_mode=effective_codec_mode,
             strategy_id=strategy.strategy_id,
             checksum=checksum,
         )
@@ -130,6 +140,42 @@ class QuenchEncoder:
         if torch is not None and isinstance(tensor, torch.Tensor):
             return tensor.detach().cpu().numpy()
         raise TypeError("Expected a numpy.ndarray or torch.Tensor input")
+
+    def _should_force_lossless(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        *,
+        name: str | None,
+    ) -> bool:
+        """Force exact routing for tiny tensors and norm parameters."""
+        if int(np.asarray(tensor).nbytes) <= 1024:
+            return True
+        return self._looks_like_norm_tensor_name(name)
+
+    @staticmethod
+    def _looks_like_norm_tensor_name(name: str | None) -> bool:
+        """Match common LayerNorm/RMSNorm parameter naming schemes."""
+        if not name:
+            return False
+
+        lower = name.lower()
+        if any(
+            token in lower
+            for token in (
+                "layernorm",
+                "layer_norm",
+                "rmsnorm",
+                "rms_norm",
+                "input_layernorm",
+                "post_attention_layernorm",
+            )
+        ):
+            return True
+        if ".ln_" in lower or lower.startswith("ln_"):
+            return True
+        if ".norm" in lower or lower.endswith(("norm.weight", "norm.bias")):
+            return True
+        return False
 
     def _checksum(self, tensor: np.ndarray[Any, np.dtype[Any]]) -> int:
         """Compute a stable checksum from the original tensor bytes."""

@@ -1089,6 +1089,97 @@ class MixedPrecisionStrategy(BaseCompressionStrategy):
         return restored.astype(np.dtype(dtype_str), copy=False)
 
 
+class MaskStrategy(BaseCompressionStrategy):
+    """Lossless strategy for binary/constant masks using RLE encoding."""
+
+    tensor_type = TensorType.MASK
+    strategy_id = 8
+    strategy_name = "mask"
+
+    def encode(
+        self,
+        tensor: np.ndarray[Any, np.dtype[Any]],
+        config: QuenchConfig,
+    ) -> tuple[bytes, dict[str, Any]]:
+        values = np.asarray(tensor, dtype=np.float32)
+        flat = values.ravel()
+        unique = np.unique(flat)
+
+        # Constant tensor: store just the value
+        if unique.size == 1:
+            payload = struct.pack("<f", float(unique[0]))
+            return payload, {
+                "lossless": True,
+                "path": "constant",
+                "dtype": np.dtype(tensor.dtype).str,
+                "shape": list(tensor.shape),
+                "value": float(unique[0]),
+            }
+
+        # RLE encoding
+        payload = self._rle_encode(flat)
+        return payload, {
+            "lossless": True,
+            "path": "rle",
+            "dtype": np.dtype(tensor.dtype).str,
+            "shape": list(tensor.shape),
+        }
+
+    def decode(
+        self,
+        data: bytes,
+        metadata: dict[str, Any],
+        config: QuenchConfig | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        dtype = np.dtype(str(metadata.get("dtype", "<f4")))
+        shape = tuple(int(dim) for dim in metadata.get("shape", []))
+        path = str(metadata.get("path", ""))
+
+        if path == "constant":
+            value = float(metadata["value"])
+            return np.full(shape, value, dtype=dtype)
+
+        if path == "rle":
+            size = int(np.prod(shape, dtype=np.int64))
+            flat = self._rle_decode(data, size)
+            return flat.astype(dtype, copy=False).reshape(shape)
+
+        # Fallback for lossless raw encoding
+        return self._decode_lossless(data, metadata, config)
+
+    @staticmethod
+    def _rle_encode(flat: np.ndarray[Any, np.dtype[np.float32]]) -> bytes:
+        """Run-length encode a flat float32 array."""
+        parts: list[bytes] = []
+        n = flat.size
+        i = 0
+        while i < n:
+            val = float(flat[i])
+            run = 1
+            while i + run < n and float(flat[i + run]) == val:
+                run += 1
+                if run == 0xFFFFFFFF:
+                    break
+            parts.append(struct.pack("<fI", val, run))
+            i += run
+        return b"".join(parts)
+
+    @staticmethod
+    def _rle_decode(data: bytes, size: int) -> np.ndarray[Any, np.dtype[np.float32]]:
+        """Decode an RLE-encoded byte stream into a flat float32 array."""
+        result = np.empty(size, dtype=np.float32)
+        offset = 0
+        pos = 0
+        entry_size = struct.calcsize("<fI")
+        while offset + entry_size <= len(data) and pos < size:
+            val, run = struct.unpack_from("<fI", data, offset)
+            offset += entry_size
+            end = min(pos + run, size)
+            result[pos:end] = val
+            pos = end
+        return result
+
+
 class DefaultStrategy(BaseCompressionStrategy):
     """Fallback strategy that quantizes directly and entropy-codes the result."""
 
@@ -1153,6 +1244,7 @@ ACTIVATION_STRATEGY = ActivationStrategy()
 OPTIMIZER_STATE_STRATEGY = OptimizerStateStrategy()
 BIAS_STRATEGY = BiasStrategy()
 MIXED_PRECISION_STRATEGY = MixedPrecisionStrategy()
+MASK_STRATEGY = MaskStrategy()
 DEFAULT_STRATEGY = DefaultStrategy()
 
 STRATEGY_REGISTRY: dict[TensorType, CompressionStrategy] = {
@@ -1163,6 +1255,7 @@ STRATEGY_REGISTRY: dict[TensorType, CompressionStrategy] = {
     TensorType.OPTIMIZER_STATE: OPTIMIZER_STATE_STRATEGY,
     TensorType.BIAS: BIAS_STRATEGY,
     TensorType.MIXED_PRECISION: MIXED_PRECISION_STRATEGY,
+    TensorType.MASK: MASK_STRATEGY,
 }
 
 STRATEGY_ID_REGISTRY: dict[int, CompressionStrategy] = {
@@ -1173,6 +1266,7 @@ STRATEGY_ID_REGISTRY: dict[int, CompressionStrategy] = {
     OPTIMIZER_STATE_STRATEGY.strategy_id: OPTIMIZER_STATE_STRATEGY,
     BIAS_STRATEGY.strategy_id: BIAS_STRATEGY,
     MIXED_PRECISION_STRATEGY.strategy_id: MIXED_PRECISION_STRATEGY,
+    MASK_STRATEGY.strategy_id: MASK_STRATEGY,
     DEFAULT_STRATEGY.strategy_id: DEFAULT_STRATEGY,
 }
 

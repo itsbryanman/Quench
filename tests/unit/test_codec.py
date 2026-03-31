@@ -113,6 +113,46 @@ def test_auto_detection_picks_expected_tensor_types() -> None:
     assert quench.compress(_activation_tensor(), name="activation").header.tensor_type == TensorType.ACTIVATION
 
 
+def test_mask_roundtrip_causal() -> None:
+    mask = np.tril(np.ones((1024, 1024), dtype=np.float32))
+    compressed = quench.compress(mask, tensor_type=TensorType.MASK)
+    restored = quench.decompress(compressed)
+    np.testing.assert_array_equal(mask, restored)
+    assert compressed.compressed_nbytes < mask.nbytes
+
+
+def test_mask_roundtrip_neg_inf() -> None:
+    mask = np.where(np.tril(np.ones((512, 512))), 0.0, float('-inf')).astype(np.float32)
+    compressed = quench.compress(mask, tensor_type=TensorType.MASK)
+    restored = quench.decompress(compressed)
+    np.testing.assert_array_equal(mask, restored)
+
+
+def test_constant_tensor_roundtrip() -> None:
+    const = np.ones((256, 256), dtype=np.float32)
+    compressed = quench.compress(const, tensor_type=TensorType.MASK)
+    restored = quench.decompress(compressed)
+    np.testing.assert_array_equal(const, restored)
+    # Constant tensor payload should be tiny (metadata + header overhead is separate)
+    assert len(compressed.payload) < 100
+
+
+def test_layernorm_weight_is_lossless() -> None:
+    """LayerNorm weights should round-trip exactly."""
+    values = np.ones(768, dtype=np.float32) + np.random.randn(768).astype(np.float32) * 0.001
+    compressed = quench.compress(values, name="model.layers.0.input_layernorm.weight")
+    restored = quench.decompress(compressed)
+    np.testing.assert_array_equal(values, restored)
+
+
+def test_tiny_tensor_is_lossless() -> None:
+    """Tensors under 1KB should always be lossless regardless of config."""
+    values = np.random.randn(64).astype(np.float32)  # 256 bytes
+    compressed = quench.compress(values, name="some.small.param")
+    restored = quench.decompress(compressed)
+    np.testing.assert_array_equal(values, restored)
+
+
 def test_decode_rejects_malformed_metadata() -> None:
     tensor = _weight_tensor()
     compressed = quench.compress(tensor, name="mlp.weight")

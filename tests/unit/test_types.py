@@ -22,9 +22,10 @@ class TestTensorType:
         assert TensorType.UNKNOWN == 5
         assert TensorType.BIAS == 6
         assert TensorType.MIXED_PRECISION == 7
+        assert TensorType.MASK == 8
 
     def test_all_members(self) -> None:
-        assert len(TensorType) == 8
+        assert len(TensorType) == 9
 
 
 class TestTensorHeader:

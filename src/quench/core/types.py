@@ -20,6 +20,7 @@ class TensorType(IntEnum):
     UNKNOWN = 5
     BIAS = 6
     MIXED_PRECISION = 7
+    MASK = 8
 
 
 class QuantMode(IntEnum):
