@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info
+*.egg-info/
+dist/
+build/
+eggs/
+*.whl
+.eggs/
+sdist/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing / CI
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+
+# Quench-specific
+.claude/
+traces/
+*.qnc
+models/
+
+# OS
+.DS_Store
+Thumbs.db
