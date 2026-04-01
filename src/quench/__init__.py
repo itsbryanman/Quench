@@ -1,6 +1,8 @@
 """Quench — format-aware compression codec for ML tensors."""
 from __future__ import annotations
 
+from typing import Any
+
 from quench.analyze import TensorProfiler, TensorTypeDetector
 from quench.backends import (
     get_backend_binding,
@@ -83,6 +85,7 @@ __all__ = [
     "UniformQuantizer",
     "__version__",
     "compress",
+    "delta",
     "decode_tensor_stream",
     "decompress",
     "encode_tensor_stream",
@@ -92,3 +95,11 @@ __all__ = [
     "iter_tensor_records",
     "list_backend_names",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "delta":
+        import quench.delta as _delta
+
+        return _delta
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -43,6 +43,10 @@ bench = [
 native = [
     "maturin>=1.7,<2.0",
 ]
+delta = [
+    "huggingface_hub>=0.20",
+    "safetensors>=0.4",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov",
@@ -57,6 +61,7 @@ Repository = "https://github.com/itsbryanman/quench"
 
 [project.scripts]
 quench-compress = "quench.cli:main"
+quench-delta = "quench.delta.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
