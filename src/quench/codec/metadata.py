@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import base64
 import json
+import operator
+from functools import reduce
 from typing import Any, Mapping
 
 import numpy as np
 
 from quench.core.exceptions import MetadataError
+
+_MAX_METADATA_ARRAY_BYTES = 256 * 1024 * 1024  # 256 MiB
 
 
 def serialize_metadata(metadata: Mapping[str, Any]) -> bytes:
@@ -80,7 +84,17 @@ def _decode_value(value: Any) -> Any:
         except (KeyError, TypeError, ValueError) as exc:
             raise MetadataError(f"Malformed ndarray metadata: {exc}") from exc
 
-        expected_size = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        element_count = reduce(operator.mul, shape, 1)
+        if element_count < 0:
+            raise MetadataError(
+                f"Metadata ndarray has negative dimension in shape {shape}"
+            )
+        expected_size = element_count * dtype.itemsize
+        if expected_size > _MAX_METADATA_ARRAY_BYTES:
+            raise MetadataError(
+                f"Metadata ndarray too large: {expected_size} bytes exceeds "
+                f"{_MAX_METADATA_ARRAY_BYTES} byte limit"
+            )
         if len(payload) != expected_size:
             raise MetadataError(
                 "Decoded ndarray metadata has unexpected byte length: "

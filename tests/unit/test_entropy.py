@@ -9,6 +9,7 @@ import numpy as np
 from quench.entropy.bitstream import BitstreamReader, BitstreamWriter
 from quench.entropy.freq_model import FrequencyModel
 from quench.entropy.rans import (
+    SCALE,
     RANSDecoder,
     RANSEncoder,
     build_freq_table,
@@ -263,3 +264,34 @@ class TestBitstream:
         r = BitstreamReader(w.getvalue())
         assert r.read_uint32() == 0
         assert r.read_uint32() == 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# normalize_freq_table edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_freq_table_many_symbols() -> None:
+    """Normalization with more symbols than SCALE must not hang."""
+    # 65536 symbols each with count 1 — already sums to SCALE
+    freq = {i: 1 for i in range(SCALE)}
+    result = normalize_freq_table(freq)
+    assert sum(result.values()) == SCALE
+    assert all(v >= 1 for v in result.values())
+
+
+def test_normalize_freq_table_large_deficit() -> None:
+    """Normalization that needs to add many counts completes quickly."""
+    freq = {0: 1, 1: 1, 2: 1}
+    result = normalize_freq_table(freq, target_total=SCALE)
+    assert sum(result.values()) == SCALE
+    assert all(v >= 1 for v in result.values())
+
+
+def test_normalize_freq_table_large_surplus() -> None:
+    """Normalization that needs to remove many counts completes quickly."""
+    # 3 symbols with huge counts, target is small
+    freq = {0: 100000, 1: 100000, 2: 100000}
+    result = normalize_freq_table(freq, target_total=1 << 16)
+    assert sum(result.values()) == 1 << 16
+    assert all(v >= 1 for v in result.values())

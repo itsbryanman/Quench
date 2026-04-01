@@ -311,6 +311,41 @@ def test_tiny_exact_bundle_candidate_selection_is_exact_and_size_limited() -> No
     assert large_candidate is None
 
 
+def test_metadata_rejects_oversized_ndarray() -> None:
+    """Crafted metadata with a huge shape must not trigger OOM."""
+    import json
+    import base64
+    from quench.codec.metadata import deserialize_metadata
+    from quench.core.exceptions import MetadataError
+
+    # Shape that would require >256 MiB
+    malicious = json.dumps({
+        "__ndarray__": True,
+        "dtype": "<f8",
+        "shape": [1, 1073741824],  # 8 GiB at float64
+        "data": base64.b64encode(b"").decode("ascii"),
+    }).encode("utf-8")
+    with pytest.raises(MetadataError, match="too large"):
+        deserialize_metadata(malicious)
+
+
+def test_metadata_rejects_overflowing_shape() -> None:
+    """Shape dimensions that overflow int64 when multiplied must not crash."""
+    import json
+    import base64
+    from quench.codec.metadata import deserialize_metadata
+    from quench.core.exceptions import MetadataError
+
+    malicious = json.dumps({
+        "__ndarray__": True,
+        "dtype": "<f4",
+        "shape": [2**33, 2**33],  # product overflows int64
+        "data": base64.b64encode(b"").decode("ascii"),
+    }).encode("utf-8")
+    with pytest.raises(MetadataError):
+        deserialize_metadata(malicious)
+
+
 def test_decode_rejects_malformed_metadata() -> None:
     tensor = _weight_tensor()
     compressed = quench.compress(tensor, name="mlp.weight")

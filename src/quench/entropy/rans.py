@@ -67,21 +67,31 @@ def normalize_freq_table(
         scaled = max(1, int(count * target_total / current_total))
         result[sym] = scaled
 
-    # Adjust to hit exact target_total by tweaking the most-frequent symbols
+    # Adjust to hit exact target_total
     diff = target_total - sum(result.values())
-    sorted_syms = sorted(freq.keys(), key=lambda s: freq[s], reverse=True)
-    idx = 0
-    while diff != 0:
-        sym = sorted_syms[idx % len(sorted_syms)]
-        if diff > 0:
-            result[sym] += 1
-            diff -= 1
-        elif result[sym] > 1:
-            result[sym] -= 1
-            diff += 1
-        idx += 1
-        if idx > len(sorted_syms) * target_total:
-            break  # safety valve
+    if diff > 0:
+        # Distribute extra counts to the most-frequent symbols
+        sorted_syms = sorted(freq.keys(), key=lambda s: freq[s], reverse=True)
+        for i in range(diff):
+            result[sorted_syms[i % len(sorted_syms)]] += 1
+    elif diff < 0:
+        # Remove counts from the most-frequent symbols (never below 1)
+        sorted_syms = sorted(freq.keys(), key=lambda s: result[s], reverse=True)
+        removed = 0
+        while removed < -diff:
+            progressed = False
+            for sym in sorted_syms:
+                if result[sym] > 1:
+                    result[sym] -= 1
+                    removed += 1
+                    progressed = True
+                    if removed >= -diff:
+                        break
+            if not progressed:
+                raise EntropyError(
+                    f"Cannot normalize frequency table: need to remove {-diff} "
+                    f"but all symbols are at minimum frequency"
+                )
 
     return result
 

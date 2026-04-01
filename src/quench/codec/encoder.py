@@ -6,7 +6,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from quench.analyze import TensorProfiler, TensorTypeDetector
+from quench.analyze import TensorTypeDetector
 from quench.codec.metadata import serialize_metadata
 from quench.codec.strategies import get_strategy
 from quench.core.config import QuenchConfig
@@ -25,8 +25,7 @@ class QuenchEncoder:
     def __init__(self, config: QuenchConfig | None = None) -> None:
         self._config = config or QuenchConfig()
         self._detector = TensorTypeDetector()
-        self._profiler = TensorProfiler()
-        self._allocator = ImportanceAllocator(self._profiler)
+        self._allocator = ImportanceAllocator()
 
     def encode(
         self,
@@ -88,9 +87,6 @@ class QuenchEncoder:
 
         detected_type = tensor_type or self._detector.detect(values, name=name)
         effective_config = config
-        # Skip profiling for mask tensors — they may contain -inf which breaks histogram
-        if detected_type != TensorType.MASK:
-            _ = self._profiler.profile(values)
 
         if self._should_force_lossless(values, name=name):
             effective_config = config.model_copy(update={"codec_mode": CodecMode.LOSSLESS})
