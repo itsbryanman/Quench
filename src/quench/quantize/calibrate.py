@@ -205,10 +205,9 @@ class PercentileCalibrationPolicy:
         else:
             raise QuantizationError("Percentile calibration does not support QuantMode.NONE")
 
-        clipped = np.clip(working, clip_min, clip_max)
         return compute_scalar_params(
-            value_min=float(np.min(clipped)),
-            value_max=float(np.max(clipped)),
+            value_min=float(clip_min),
+            value_max=float(clip_max),
             bits=bits,
             mode=mode,
             dtype_orig=values.dtype.str,

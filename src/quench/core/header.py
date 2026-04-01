@@ -40,6 +40,13 @@ def encode_header(header: TensorHeader) -> bytes:
     ndim = len(header.shape)
     if ndim > _MAX_DIMS:
         raise HeaderError(f"Too many dimensions ({ndim} > {_MAX_DIMS})")
+    for i, dim in enumerate(header.shape):
+        if dim < 0:
+            raise HeaderError(f"Negative dimension at axis {i}: {dim}")
+        if dim > 0xFFFFFFFF:
+            raise HeaderError(
+                f"Dimension {dim} at axis {i} exceeds uint32 maximum (4294967295)"
+            )
 
     dtype_bytes = header.dtype.encode("ascii")
     if len(dtype_bytes) > _DTYPE_FIELD_LEN:

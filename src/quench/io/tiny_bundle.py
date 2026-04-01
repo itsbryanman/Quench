@@ -395,14 +395,15 @@ def _payload_nbytes(kind: str, dtype: np.dtype[Any], shape: tuple[int, ...]) -> 
 
 
 def _encode_dtype_token(dtype: np.dtype[Any]) -> bytes:
-    token = np.dtype(dtype).str
+    token = str(np.dtype(dtype).str)
     code = _DTYPE_TO_CODE.get(token)
     if code is not None:
         return bytes([code])
-    inline = token.encode("ascii")
+    inline: bytes = token.encode("ascii")
     if len(inline) > 255:
         raise ValueError(f"dtype token is too long for tiny exact bundle: {token!r}")
-    return bytes([_INLINE_DTYPE_CODE, len(inline)]) + inline
+    encoded: bytes = bytes([_INLINE_DTYPE_CODE, len(inline)]) + inline
+    return encoded
 
 
 def _decode_dtype_token(data: bytes, cursor: int) -> tuple[np.dtype[Any], int]:

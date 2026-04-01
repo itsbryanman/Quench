@@ -68,6 +68,12 @@ class FrequencyModel:
         offset = 0
         (num_symbols,) = struct.unpack_from("<I", data, offset)
         offset += 4
+        available = len(data) - offset
+        if num_symbols > available // 8:
+            raise ValueError(
+                f"Frequency model claims {num_symbols} symbols but only "
+                f"{available} bytes remain (need {num_symbols * 8})"
+            )
         freq: dict[int, int] = {}
         for _ in range(num_symbols):
             sym, count = struct.unpack_from("<iI", data, offset)

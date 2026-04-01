@@ -60,7 +60,7 @@ def list_backend_names() -> list[str]:
     return sorted(set(_ENTROPY_BACKENDS) | set(_PACKING_BACKENDS))
 
 
-def _load_optional_rust_backends() -> tuple[EntropyBackend, PackingBackend] | None:
+def _load_optional_rust_backends() -> tuple[EntropyBackend, PackingBackend]:
     from quench.backends.rust_backend import RustEntropyBackend, RustPackingBackend
 
     return RustEntropyBackend(), RustPackingBackend()
@@ -93,4 +93,3 @@ def get_native_backend_import_error() -> ImportError | None:
 
 register_entropy_backend(PythonEntropyBackend())
 register_packing_backend(PythonPackingBackend())
-register_optional_rust_backend()

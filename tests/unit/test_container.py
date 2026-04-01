@@ -5,10 +5,12 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from quench.codec import QuenchEncoder
 from quench.core.config import QuenchConfig
 from quench.core.header import encode_header
+from quench.core.exceptions import CodecError
 from quench.core.types import CodecMode, QuantMode
 from quench.integrations import load_compressed, save_compressed, save_compressed_bundle
 from quench.io import QNCReader, QNCWriter
@@ -115,6 +117,67 @@ def test_save_compressed_without_eligible_tiny_exacts_keeps_regular_v2_path(tmp_
     assert _container_version(path) == QNC_VERSION_V2
     assert SEGMENT_TYPE_TINY_EXACT_BUNDLE not in _segment_types(path)
     assert SEGMENT_TYPE_TENSOR in _segment_types(path)
+
+
+def test_reader_rejects_truncated_segment(tmp_path: Path) -> None:
+    from quench.io.container import (
+        QNC_FLAG_COUNT_KNOWN,
+        QNC_FLAG_STREAMED,
+        QNC_MAGIC,
+        QNC_VERSION_V2,
+        SEGMENT_MAGIC,
+        SEGMENT_TYPE_TENSOR,
+        SEGMENT_VERSION,
+        _HEADER_PREFIX,
+        _HEADER_V2_REST,
+        _SEGMENT_HEADER,
+    )
+
+    path = tmp_path / "truncated.qnc"
+    with path.open("wb") as handle:
+        handle.write(_HEADER_PREFIX.pack(QNC_MAGIC, QNC_VERSION_V2))
+        handle.write(_HEADER_V2_REST.pack(QNC_FLAG_STREAMED | QNC_FLAG_COUNT_KNOWN, 1))
+        handle.write(
+            _SEGMENT_HEADER.pack(
+                SEGMENT_MAGIC,
+                SEGMENT_VERSION,
+                SEGMENT_TYPE_TENSOR,
+                0,
+                1000,
+                0,
+            )
+        )
+
+    with pytest.raises(CodecError):
+        list(QNCReader(path).iter_tensor_records())
+
+
+def test_reader_rejects_bad_magic(tmp_path: Path) -> None:
+    path = tmp_path / "bad_magic.qnc"
+    with path.open("wb") as handle:
+        handle.write(b"NOPE\x02\x00\x01\x00\x01\x00\x00\x00")
+
+    with pytest.raises(CodecError, match="magic"):
+        list(QNCReader(path).iter_tensor_records())
+
+
+def test_reader_rejects_tensor_count_mismatch(tmp_path: Path) -> None:
+    from quench.io.container import (
+        QNC_FLAG_COUNT_KNOWN,
+        QNC_FLAG_STREAMED,
+        QNC_MAGIC,
+        QNC_VERSION_V2,
+        _HEADER_PREFIX,
+        _HEADER_V2_REST,
+    )
+
+    path = tmp_path / "mismatch.qnc"
+    with path.open("wb") as handle:
+        handle.write(_HEADER_PREFIX.pack(QNC_MAGIC, QNC_VERSION_V2))
+        handle.write(_HEADER_V2_REST.pack(QNC_FLAG_STREAMED | QNC_FLAG_COUNT_KNOWN, 5))
+
+    with pytest.raises(CodecError, match="mismatch"):
+        list(QNCReader(path).iter_tensor_records())
 
 
 def _container_version(path: Path) -> int:

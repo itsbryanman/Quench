@@ -7,13 +7,28 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, cast
 
 import numpy as np
 
 from quench.backends.python_backend import PythonPackingBackend
 from quench.core.exceptions import EntropyError
 from quench.entropy.freq_model import FrequencyModel
+
+
+class _NativeRustModule(Protocol):
+    def encode_symbols(
+        self,
+        symbols: np.ndarray[Any, np.dtype[np.int64]],
+        freq_table: dict[int, int],
+    ) -> bytes: ...
+
+    def decode_symbols(
+        self,
+        data: bytes,
+        freq_table: dict[int, int],
+        num_symbols: int,
+    ) -> np.ndarray[Any, np.dtype[np.int64]]: ...
 
 
 def _native_build_candidates() -> list[Path]:
@@ -36,7 +51,7 @@ def _native_build_candidates() -> list[Path]:
     return candidates
 
 
-def _load_module_from_build_output() -> ModuleType:
+def _load_module_from_build_output() -> _NativeRustModule:
     last_error: ImportError | None = None
     for candidate in _native_build_candidates():
         spec = importlib.util.spec_from_file_location("quench_native", candidate)
@@ -50,17 +65,17 @@ def _load_module_from_build_output() -> ModuleType:
             last_error = ImportError(str(exc))
             sys.modules.pop("quench_native", None)
             continue
-        return module
+        return cast(_NativeRustModule, module)
     if last_error is not None:
         raise last_error
     raise ImportError("quench_native is not installed and no local build artifact was found")
 
 
 @lru_cache(maxsize=1)
-def load_native_module() -> ModuleType:
+def load_native_module() -> _NativeRustModule:
     """Import the compiled Rust extension or load it from a local cargo build."""
     try:
-        return importlib.import_module("quench_native")
+        return cast(_NativeRustModule, importlib.import_module("quench_native"))
     except ImportError:
         try:
             return _load_module_from_build_output()
@@ -91,8 +106,14 @@ class RustEntropyBackend:
         freq_model: FrequencyModel,
     ) -> bytes:
         array = np.ascontiguousarray(np.asarray(symbols).reshape(-1).astype(np.int64, copy=False))
+        freq_dict = dict(freq_model.freq_table)
+        for sym, count in freq_dict.items():
+            if count > 0xFFFFFFFF:
+                raise EntropyError(
+                    f"Frequency {count} for symbol {sym} exceeds u32 max for Rust backend"
+                )
         try:
-            return self._native.encode_symbols(array, dict(freq_model.freq_table))
+            return self._native.encode_symbols(array, freq_dict)
         except Exception as exc:
             raise EntropyError(str(exc)) from exc
 
@@ -102,8 +123,14 @@ class RustEntropyBackend:
         freq_model: FrequencyModel,
         num_symbols: int,
     ) -> np.ndarray[Any, np.dtype[np.int64]]:
+        freq_dict = dict(freq_model.freq_table)
+        for sym, count in freq_dict.items():
+            if count > 0xFFFFFFFF:
+                raise EntropyError(
+                    f"Frequency {count} for symbol {sym} exceeds u32 max for Rust backend"
+                )
         try:
-            decoded = self._native.decode_symbols(data, dict(freq_model.freq_table), int(num_symbols))
+            decoded = self._native.decode_symbols(data, freq_dict, int(num_symbols))
         except Exception as exc:
             raise EntropyError(str(exc)) from exc
         return np.asarray(decoded, dtype=np.int64)

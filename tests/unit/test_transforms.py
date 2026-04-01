@@ -174,3 +174,51 @@ class TestTransformPipeline:
         restored = normalizer.denormalize(normalized, scales, zero_points, axis=0)
 
         np.testing.assert_allclose(restored, tensor, atol=1e-5)
+
+    def test_pipeline_single_step_roundtrip(self) -> None:
+        pipeline = TransformPipeline()
+        pipeline.add_step(
+            name="negate",
+            transform_fn=lambda tensor: (-tensor, None),
+            inverse_fn=lambda tensor: -tensor,
+        )
+        tensor = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+        transformed, metadata = pipeline.forward(tensor)
+        np.testing.assert_array_equal(transformed, -tensor)
+        restored = pipeline.inverse(transformed, metadata)
+        np.testing.assert_array_equal(restored, tensor)
+
+    def test_pipeline_multi_step_roundtrip(self) -> None:
+        pipeline = TransformPipeline()
+        pipeline.add_step(
+            name="double",
+            transform_fn=lambda tensor: (tensor * 2, {"factor": 2}),
+            inverse_fn=lambda tensor, meta: tensor / meta["factor"],
+        )
+        pipeline.add_step(
+            name="offset",
+            transform_fn=lambda tensor: (tensor + 10, {"offset": 10}),
+            inverse_fn=lambda tensor, meta: tensor - meta["offset"],
+        )
+        tensor = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+
+        transformed, metadata = pipeline.forward(tensor)
+        restored = pipeline.inverse(transformed, metadata)
+        np.testing.assert_allclose(restored, tensor)
+
+    def test_pipeline_rejects_mismatched_metadata(self) -> None:
+        pipeline = TransformPipeline()
+        pipeline.add_step("identity", lambda tensor: tensor, lambda tensor: tensor)
+        tensor = np.array([1.0])
+        _, metadata = pipeline.forward(tensor)
+
+        with pytest.raises(ValueError, match="length"):
+            pipeline.inverse(tensor, metadata[:-1])
+
+    def test_pipeline_rejects_duplicate_step_names(self) -> None:
+        pipeline = TransformPipeline()
+        pipeline.add_step("step", lambda tensor: tensor, lambda tensor: tensor)
+
+        with pytest.raises(ValueError, match="Duplicate"):
+            pipeline.add_step("step", lambda tensor: tensor, lambda tensor: tensor)

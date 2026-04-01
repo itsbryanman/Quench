@@ -80,3 +80,27 @@ class TestQuenchConfig:
             block_size=64,
         )
         assert cfg.block_size == 64
+
+
+def test_config_yaml_roundtrip(tmp_path: Path) -> None:
+    config = QuenchConfig(
+        target_bits=6,
+        codec_mode=CodecMode.LOSSY,
+        quant_mode=QuantMode.ASYMMETRIC,
+        quantization_granularity=QuantizationGranularity.BLOCKWISE,
+        calibration_policy=CalibrationPolicyKind.PERCENTILE,
+        block_size=64,
+        percentile_value=99.5,
+    )
+    path = tmp_path / "test_config.yaml"
+
+    config.to_yaml(path)
+    loaded = QuenchConfig.from_yaml(path)
+
+    assert loaded.target_bits == config.target_bits
+    assert loaded.codec_mode == config.codec_mode
+    assert loaded.quant_mode == config.quant_mode
+    assert loaded.quantization_granularity == config.quantization_granularity
+    assert loaded.calibration_policy == config.calibration_policy
+    assert loaded.block_size == config.block_size
+    assert loaded.percentile_value == config.percentile_value

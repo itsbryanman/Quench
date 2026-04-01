@@ -1,4 +1,4 @@
-.PHONY: install native-build native-develop test lint typecheck bench clean
+.PHONY: install native-build native-develop test lint format typecheck bench clean
 
 install:
 	pip install -e ".[dev]"
@@ -14,6 +14,10 @@ test:
 
 lint:
 	ruff check src/ tests/
+	ruff format --check src/ tests/
+
+format:
+	ruff format src/ tests/
 
 typecheck:
 	mypy src/quench/

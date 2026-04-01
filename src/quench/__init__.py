@@ -8,12 +8,8 @@ from quench.backends import (
     get_packing_backend,
     list_backend_names,
 )
-from quench.codec import (
-    QuenchDecoder,
-    QuenchEncoder,
-    auto_compress,
-    auto_decompress,
-)
+from quench.codec import QuenchDecoder, QuenchEncoder
+from quench.codec.auto import auto_compress, auto_decompress
 from quench.io import QNCReader, QNCWriter, decode_tensor_stream, encode_tensor_stream, iter_tensor_records
 from quench.core.config import QuenchConfig
 from quench.core.types import CodecMode, CompressedTensor, QuantMode, TensorHeader, TensorType

@@ -128,6 +128,27 @@ def test_total_compression_is_better_than_raw_and_prints_summary() -> None:
         assert total_compressed <= int(total_zstd * 1.15)
 
 
+@pytest.mark.parametrize("granularity", ["per_tensor", "per_channel", "blockwise"])
+def test_roundtrip_all_granularities(granularity: str) -> None:
+    config = QuenchConfig(
+        target_bits=4,
+        quantization_granularity=granularity,
+        block_size=16,
+    )
+    rng = np.random.default_rng(999)
+    tensor = rng.normal(size=(64, 32)).astype(np.float32)
+    encoder = QuenchEncoder(config=config)
+    decoder = QuenchDecoder(config=config)
+
+    compressed = encoder.encode(tensor, name="test.weight")
+    restored = decoder.decode(compressed)
+
+    assert restored.shape == tensor.shape
+    assert restored.dtype == tensor.dtype
+    error = np.abs(restored - tensor)
+    assert float(np.mean(error)) < 0.1
+
+
 @pytest.mark.skipif(not native_backend_available(), reason="Rust backend not built")
 @pytest.mark.parametrize(
     ("name", "mae_limit", "max_limit"),

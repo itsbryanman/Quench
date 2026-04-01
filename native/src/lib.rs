@@ -118,7 +118,13 @@ fn encode_impl(symbols: &[i64], model: &Model) -> PyResult<Vec<u8>> {
             emitted.push((state & 0xFF) as u8);
             state >>= 8;
         }
-        state = (state / freq) * model.total + cumfreq + (state % freq);
+        let quotient = state / freq;
+        let remainder = state % freq;
+        state = quotient
+            .checked_mul(model.total)
+            .and_then(|v| v.checked_add(cumfreq))
+            .and_then(|v| v.checked_add(remainder))
+            .ok_or_else(|| PyValueError::new_err("rANS state overflow during encoding"))?;
     }
 
     let mut output = Vec::with_capacity(8 + emitted.len());
@@ -152,12 +158,26 @@ fn decode_impl(data: &[u8], model: &Model, num_symbols: usize) -> PyResult<Vec<i
             .ok_or_else(|| PyValueError::new_err("Decoded slot index exceeds frequency table"))?;
         let freq = u64::from(entry.freq);
         let cumfreq = u64::from(entry.cumfreq);
-        state = freq * (state >> SCALE_BITS) + u64::try_from(slot).unwrap() - cumfreq;
+        let upper = freq
+            .checked_mul(state >> SCALE_BITS)
+            .ok_or_else(|| PyValueError::new_err("rANS state overflow during decoding"))?;
+        let slot_u64 =
+            u64::try_from(slot).map_err(|_| PyValueError::new_err("Slot index overflow"))?;
+        state = upper
+            .checked_add(slot_u64)
+            .and_then(|v| v.checked_sub(cumfreq))
+            .ok_or_else(|| PyValueError::new_err("rANS state underflow during decoding"))?;
         while state < RANS_L && position < data.len() {
             state = (state << 8) | u64::from(data[position]);
             position += 1;
         }
         output.push(entry.symbol);
+    }
+
+    if state < RANS_L {
+        return Err(PyValueError::new_err(
+            "rANS decoder state is below RANS_L after decoding — data may be corrupt or truncated",
+        ));
     }
 
     Ok(output)

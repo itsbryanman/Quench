@@ -93,11 +93,32 @@ class PerChannelQuantizer:
         moved = np.moveaxis(values, axis, 0)
         if moved.shape[0] != len(params.params):
             raise QuantizationError("Per-channel parameter count does not match the tensor axis length")
-        quantized_channels = [
-            self._per_tensor.quantize(channel, channel_params)
-            for channel, channel_params in zip(moved, params.params)
-        ]
-        return np.moveaxis(np.stack(quantized_channels, axis=0), 0, axis)
+
+        bits = params.params[0].bits
+        mode = params.params[0].mode
+        can_vectorize = all(p.bits == bits and p.mode == mode for p in params.params)
+        if not can_vectorize:
+            quantized_channels = [
+                self._per_tensor.quantize(channel, channel_params)
+                for channel, channel_params in zip(moved, params.params)
+            ]
+            return np.moveaxis(np.stack(quantized_channels, axis=0), 0, axis)
+
+        qmin, qmax = quantized_bounds(bits, mode)
+        scales = np.array([p.scale for p in params.params], dtype=np.float64)
+        zero_points = np.array([p.zero_point for p in params.params], dtype=np.float64)
+
+        flat = moved.reshape(moved.shape[0], -1).astype(np.float64)
+        if mode == QuantMode.SYMMETRIC:
+            scaled = np.rint(flat / scales[:, None])
+        elif mode == QuantMode.ASYMMETRIC:
+            scaled = np.rint(flat / scales[:, None]) + zero_points[:, None]
+        else:
+            raise QuantizationError("PerChannelQuantizer does not support QuantMode.NONE")
+
+        clipped = np.clip(scaled, qmin, qmax)
+        result = clipped.reshape(moved.shape).astype(storage_dtype(bits, mode), copy=False)
+        return np.moveaxis(result, 0, axis)
 
     def dequantize(
         self,
@@ -115,11 +136,31 @@ class PerChannelQuantizer:
         moved = np.moveaxis(values, axis, 0)
         if moved.shape[0] != len(params.params):
             raise QuantizationError("Per-channel parameter count does not match the tensor axis length")
-        restored_channels = [
-            self._per_tensor.dequantize(channel, channel_params)
-            for channel, channel_params in zip(moved, params.params)
-        ]
-        return np.moveaxis(np.stack(restored_channels, axis=0), 0, axis)
+
+        bits = params.params[0].bits
+        mode = params.params[0].mode
+        can_vectorize = all(p.bits == bits and p.mode == mode for p in params.params)
+        if not can_vectorize:
+            restored_channels = [
+                self._per_tensor.dequantize(channel, channel_params)
+                for channel, channel_params in zip(moved, params.params)
+            ]
+            return np.moveaxis(np.stack(restored_channels, axis=0), 0, axis)
+
+        scales = np.array([p.scale for p in params.params], dtype=np.float64)
+        zero_points = np.array([p.zero_point for p in params.params], dtype=np.float64)
+        dtype_orig = params.params[0].dtype_orig
+
+        flat = moved.reshape(moved.shape[0], -1).astype(np.float64)
+        if mode == QuantMode.SYMMETRIC:
+            restored = flat * scales[:, None]
+        elif mode == QuantMode.ASYMMETRIC:
+            restored = (flat - zero_points[:, None]) * scales[:, None]
+        else:
+            raise QuantizationError("PerChannelQuantizer does not support QuantMode.NONE")
+
+        result = restored.reshape(moved.shape).astype(np.dtype(dtype_orig), copy=False)
+        return np.moveaxis(result, 0, axis)
 
 
 class BlockwiseQuantizer:

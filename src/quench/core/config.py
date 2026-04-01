@@ -1,11 +1,12 @@
 """Quench configuration via Pydantic v2."""
 from __future__ import annotations
 
+import warnings
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from quench.core.types import CodecMode, QuantMode
@@ -67,6 +68,13 @@ class QuenchConfig(BaseModel):
         normalized = dict(data)
         granularity_present = "quantization_granularity" in normalized
         per_channel_present = "per_channel" in normalized
+
+        if per_channel_present:
+            warnings.warn(
+                "QuenchConfig.per_channel is deprecated; use quantization_granularity instead",
+                DeprecationWarning,
+                stacklevel=4,
+            )
 
         if granularity_present and not per_channel_present:
             granularity = normalized["quantization_granularity"]

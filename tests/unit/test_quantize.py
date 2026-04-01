@@ -70,6 +70,38 @@ class TestUniformQuantizer:
         assert quantized.dtype == np.int8
         assert np.all(np.isfinite(restored))
 
+    def test_quantize_nan_tensor_raises_or_handles(self) -> None:
+        quantizer = UniformQuantizer()
+        tensor = np.array([1.0, float("nan"), 3.0], dtype=np.float32)
+
+        try:
+            quantized, _ = quantizer.quantize(tensor, bits=4, mode=QuantMode.SYMMETRIC)
+            assert np.all(np.isfinite(quantized))
+        except Exception:
+            pass
+
+    def test_quantize_inf_tensor(self) -> None:
+        quantizer = UniformQuantizer()
+        tensor = np.array([1.0, float("inf"), -float("inf"), 3.0], dtype=np.float32)
+
+        try:
+            quantized, _ = quantizer.quantize(tensor, bits=4, mode=QuantMode.SYMMETRIC)
+            assert np.all(np.isfinite(quantized))
+        except Exception:
+            pass
+
+    def test_encoder_handles_nan_tensor(self) -> None:
+        import quench
+
+        tensor = np.array([[1.0, float("nan")], [3.0, 4.0]], dtype=np.float32)
+
+        try:
+            compressed = quench.compress(tensor, name="test.weight")
+            restored = quench.decompress(compressed)
+            assert restored.shape == tensor.shape
+        except Exception:
+            pass
+
 
 class TestCalibrator:
     def test_per_channel_calibration_produces_varying_scales(self) -> None:

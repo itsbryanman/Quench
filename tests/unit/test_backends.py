@@ -80,6 +80,55 @@ def test_python_packing_backend_roundtrip() -> None:
     np.testing.assert_array_equal(unpacked, symbols)
 
 
+@pytest.mark.parametrize(
+    ("bits", "signed"),
+    [
+        (1, False),
+        (2, False),
+        (4, False),
+        (4, True),
+        (8, False),
+        (8, True),
+    ],
+)
+def test_python_packing_roundtrip(bits: int, signed: bool) -> None:
+    backend = PythonPackingBackend()
+    rng = np.random.default_rng(42)
+    if signed:
+        lo = -(1 << (bits - 1))
+        hi = 1 << (bits - 1)
+        symbols = rng.integers(lo, hi, size=(100,), dtype=np.int64)
+    else:
+        symbols = rng.integers(0, 1 << bits, size=(100,), dtype=np.int64)
+
+    packed = backend.pack_bits(symbols, bits=bits, signed=signed)
+    restored = backend.unpack_bits(
+        packed,
+        bits=bits,
+        signed=signed,
+        shape=(100,),
+        layout_metadata={"dtype": symbols.dtype.str},
+    )
+
+    np.testing.assert_array_equal(restored.reshape(-1), symbols)
+
+
+def test_python_packing_single_element() -> None:
+    backend = PythonPackingBackend()
+    symbols = np.array([7], dtype=np.int64)
+
+    packed = backend.pack_bits(symbols, bits=4, signed=False)
+    restored = backend.unpack_bits(
+        packed,
+        bits=4,
+        signed=False,
+        shape=(1,),
+        layout_metadata={"dtype": symbols.dtype.str},
+    )
+
+    np.testing.assert_array_equal(restored.reshape(-1), symbols)
+
+
 def test_register_optional_rust_backend_falls_back_when_native_import_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

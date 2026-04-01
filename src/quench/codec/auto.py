@@ -10,10 +10,13 @@ from quench.codec.encoder import QuenchEncoder
 from quench.core.config import QuenchConfig
 from quench.core.types import CompressedTensor, TensorType
 
+torch: Any
 try:  # pragma: no cover - torch is optional
-    import torch
+    import torch as _torch
 except Exception:  # pragma: no cover - torch is optional
     torch = None
+else:  # pragma: no cover - torch is optional
+    torch = _torch
 
 
 def auto_compress(

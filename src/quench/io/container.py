@@ -40,6 +40,9 @@ _HEADER_V1_REST = struct.Struct("<I")
 _HEADER_V2_REST = struct.Struct("<HI")
 _SEGMENT_HEADER = struct.Struct("<4sBBHQQ")
 
+_MAX_SEGMENT_METADATA_BYTES = 256 * 1024 * 1024
+_MAX_SEGMENT_PAYLOAD_BYTES = 4 * 1024 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class PayloadChunkRef:
@@ -318,6 +321,7 @@ class QNCReader:
                 segment_type = int(segment[2])
                 metadata_len = int(segment[4])
                 payload_len = int(segment[5])
+                _validate_segment_lengths(metadata_len, payload_len)
                 segment_nbytes = _SEGMENT_HEADER.size + metadata_len + payload_len
 
                 if segment_type == SEGMENT_TYPE_TENSOR:
@@ -359,15 +363,19 @@ class QNCReader:
 
         for _ in range(tensor_count):
             (name_len,) = name_length.unpack(_read_exact(handle, name_length.size, "tensor name length"))
+            _validate_metadata_length(name_len, "Tensor name")
             name = _read_exact(handle, name_len, "tensor name").decode("utf-8")
 
             (header_len,) = header_length.unpack(_read_exact(handle, header_length.size, "tensor header length"))
+            _validate_metadata_length(header_len, "Tensor header")
             header = decode_header(_read_exact(handle, header_len, "tensor header"))
 
             (metadata_len,) = blob_length.unpack(_read_exact(handle, blob_length.size, "metadata length"))
+            _validate_metadata_length(metadata_len, "Tensor metadata")
             metadata = _read_exact(handle, metadata_len, "tensor metadata")
 
             (payload_len,) = blob_length.unpack(_read_exact(handle, blob_length.size, "payload length"))
+            _validate_payload_length(payload_len, "Tensor payload")
             payload_offset = handle.tell()
             handle.seek(payload_len, io.SEEK_CUR)
 
@@ -434,6 +442,7 @@ class QNCReader:
                 raise CodecError(f"Expected chunk segment for {name}, found type {segment[2]}")
             metadata_len = int(segment[4])
             payload_len = int(segment[5])
+            _validate_segment_lengths(metadata_len, payload_len)
             storage_nbytes += _SEGMENT_HEADER.size + metadata_len + payload_len
             chunk_metadata = deserialize_metadata(
                 _read_exact(handle, metadata_len, f"chunk metadata for {name}")
@@ -546,6 +555,33 @@ def _read_exact(handle: BinaryIO, length: int, label: str) -> bytes:
     if len(data) != length:
         raise CodecError(f"Unexpected EOF while reading {label}")
     return data
+
+
+def _validate_metadata_length(length: int, label: str) -> None:
+    if length > _MAX_SEGMENT_METADATA_BYTES:
+        raise CodecError(
+            f"{label} length {length} exceeds {_MAX_SEGMENT_METADATA_BYTES} byte safety limit"
+        )
+
+
+def _validate_payload_length(length: int, label: str) -> None:
+    if length > _MAX_SEGMENT_PAYLOAD_BYTES:
+        raise CodecError(
+            f"{label} length {length} exceeds {_MAX_SEGMENT_PAYLOAD_BYTES} byte safety limit"
+        )
+
+
+def _validate_segment_lengths(metadata_len: int, payload_len: int) -> None:
+    if metadata_len > _MAX_SEGMENT_METADATA_BYTES:
+        raise CodecError(
+            f"Segment metadata length {metadata_len} exceeds "
+            f"{_MAX_SEGMENT_METADATA_BYTES} byte safety limit"
+        )
+    if payload_len > _MAX_SEGMENT_PAYLOAD_BYTES:
+        raise CodecError(
+            f"Segment payload length {payload_len} exceeds "
+            f"{_MAX_SEGMENT_PAYLOAD_BYTES} byte safety limit"
+        )
 
 
 def _header_nbytes(dtype_name: str, shape: tuple[int, ...]) -> int:

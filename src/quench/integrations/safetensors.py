@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Protocol, TypeAlias, cast
 
 import numpy as np
 
@@ -17,10 +17,43 @@ from quench.io import QNCReader, QNCWriter
 from quench.io.container import QNC_VERSION_V2, QNC_VERSION_V3
 from quench.io.tiny_bundle import try_build_tiny_exact_bundle_entry
 
+
+class _SafeOpenHandle(Protocol):
+    def __enter__(self) -> _SafeOpenHandle: ...
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool | None: ...
+    def keys(self) -> Iterable[str]: ...
+    def get_tensor(self, name: str) -> np.ndarray[Any, np.dtype[Any]]: ...
+
+
+class _SafeOpenFn(Protocol):
+    def __call__(self, filename: str, *, framework: str) -> _SafeOpenHandle: ...
+
+
+class _LoadSafetensorsFn(Protocol):
+    def __call__(self, filename: str) -> dict[str, np.ndarray[Any, np.dtype[Any]]]: ...
+
+
+class _SaveSafetensorsFn(Protocol):
+    def __call__(
+        self,
+        tensors: dict[str, np.ndarray[Any, np.dtype[Any]]],
+        filename: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None: ...
+
+
+_safe_open: _SafeOpenFn | None
+_load_safetensors: _LoadSafetensorsFn | None
+_save_safetensors: _SaveSafetensorsFn | None
+
 try:  # pragma: no cover - optional dependency
-    from safetensors import safe_open as _safe_open
-    from safetensors.numpy import load_file as _load_safetensors
-    from safetensors.numpy import save_file as _save_safetensors
+    from safetensors import safe_open as _safe_open_impl
+    from safetensors.numpy import load_file as _load_safetensors_impl
+    from safetensors.numpy import save_file as _save_safetensors_impl
+
+    _safe_open = cast(_SafeOpenFn, _safe_open_impl)
+    _load_safetensors = cast(_LoadSafetensorsFn, _load_safetensors_impl)
+    _save_safetensors = cast(_SaveSafetensorsFn, _save_safetensors_impl)
 except Exception:  # pragma: no cover - optional dependency
     _safe_open = None
     _load_safetensors = None
@@ -184,7 +217,8 @@ def save_tensor_mapping(
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if destination.suffix == ".npz":
-        np.savez(destination, **{name: np.asarray(value) for name, value in tensors.items()})
+        tensor_arrays: dict[str, Any] = {name: np.asarray(value) for name, value in tensors.items()}
+        np.savez(str(destination), **tensor_arrays)
         return
     if destination.suffix == ".npy":
         if len(tensors) != 1:

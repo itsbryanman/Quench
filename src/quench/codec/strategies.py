@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import struct
 from abc import ABC, abstractmethod
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 
@@ -148,7 +148,7 @@ class BaseCompressionStrategy(ABC):
         data: bytes,
         metadata: dict[str, Any],
         config: QuenchConfig | None,
-    ) -> np.ndarray[Any, np.dtype[np.uint8]]:
+    ) -> np.ndarray[Any, np.dtype[Any]]:
         """Decode a compact or legacy lossless byte stream."""
         kind = str(metadata.get(self._COMPACT_KIND_KEY, metadata.get("path", "")))
         dtype, shape = self._metadata_dtype_shape(metadata)
@@ -160,7 +160,10 @@ class BaseCompressionStrategy(ABC):
                     "Raw exact payload size mismatch: "
                     f"expected {expected_size}, got {len(data)}"
                 )
-            return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+            return cast(
+                np.ndarray[Any, np.dtype[Any]],
+                np.frombuffer(data, dtype=dtype).reshape(shape).copy(),
+            )
 
         if kind == "const":
             if len(data) != dtype.itemsize:
@@ -180,7 +183,10 @@ class BaseCompressionStrategy(ABC):
         stream_metadata = self._require_mapping(metadata, "stream")
         decoded = self._decode_symbol_stream(data, stream_metadata, config=config)
         raw = np.ascontiguousarray(decoded.astype(np.uint8, copy=False))
-        return np.frombuffer(raw.tobytes(), dtype=dtype).reshape(shape).copy()
+        return cast(
+            np.ndarray[Any, np.dtype[Any]],
+            np.frombuffer(raw.tobytes(), dtype=dtype).reshape(shape).copy(),
+        )
 
     def _encode_structured_exact(
         self,
@@ -190,16 +196,6 @@ class BaseCompressionStrategy(ABC):
         values = np.asarray(tensor)
         if values.size == 0:
             return None
-
-        if np.unique(values).size == 1:
-            scalar = np.ascontiguousarray(values.reshape(-1)[:1])
-            return (
-                scalar.tobytes(),
-                {
-                    self._COMPACT_LOSSLESS_FLAG: 1,
-                    self._COMPACT_KIND_KEY: "const",
-                },
-            )
 
         flat_sequence = self._detect_flat_arithmetic_sequence(values)
         if flat_sequence is not None:
@@ -225,6 +221,16 @@ class BaseCompressionStrategy(ABC):
                     "a": int(axis),
                     "p": int(step),
                     "v": int(start),
+                },
+            )
+
+        if values.size <= 16_384 and np.unique(values).size == 1:
+            scalar = np.ascontiguousarray(values.reshape(-1)[:1])
+            return (
+                scalar.tobytes(),
+                {
+                    self._COMPACT_LOSSLESS_FLAG: 1,
+                    self._COMPACT_KIND_KEY: "const",
                 },
             )
         return None
@@ -281,7 +287,10 @@ class BaseCompressionStrategy(ABC):
         sequence = (start + step * np.arange(length, dtype=np.int64)).astype(dtype, copy=False)
         view_shape = [1] * len(shape)
         view_shape[axis] = length
-        return np.broadcast_to(sequence.reshape(view_shape), shape).copy()
+        return cast(
+            np.ndarray[Any, np.dtype[Any]],
+            np.broadcast_to(sequence.reshape(view_shape), shape).copy(),
+        )
 
     def _detect_flat_arithmetic_sequence(
         self,
@@ -380,7 +389,10 @@ class BaseCompressionStrategy(ABC):
         if kind == "global":
             reshaped = np.asarray(tensor, dtype=np.float32).reshape(1, -1)
             restored = self._normalizer.denormalize(reshaped, scales, zero_points, axis=0)
-            return restored.reshape(tensor.shape)
+            return cast(
+                np.ndarray[Any, np.dtype[np.float32]],
+                restored.reshape(tensor.shape),
+            )
         raise MalformedPayloadError(f"Unsupported normalization metadata kind: {kind!r}")
 
     def _quantize_tensor(
@@ -397,7 +409,7 @@ class BaseCompressionStrategy(ABC):
         values = np.asarray(tensor)
 
         # Boost precision for small tensors that cannot amortize quantization noise.
-        if values.size < 2048 and bits < 8:
+        if values.size <= 2048 and bits < 8:
             bits = min(bits + 2, 8)
 
         layout = self._resolve_layout(
@@ -424,7 +436,7 @@ class BaseCompressionStrategy(ABC):
         layout = deserialize_layout(self._require_mapping(metadata, "layout"))
         params = deserialize_quant_params(self._require_mapping(metadata, "params"))
         quantizer = self._resolve_quantizer(layout)
-        return quantizer.dequantize(quantized, params)
+        return cast(np.ndarray[Any, np.dtype[Any]], quantizer.dequantize(quantized, params))
 
     def _resolve_layout(
         self,
@@ -558,7 +570,10 @@ class BaseCompressionStrategy(ABC):
                     "Raw symbol stream size mismatch: "
                     f"expected {expected_size}, got {len(data)}"
                 )
-            return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+            return cast(
+                np.ndarray[Any, np.dtype[Any]],
+                np.frombuffer(data, dtype=dtype).reshape(shape).copy(),
+            )
         if encoding == "packed":
             backend = get_packing_backend(active_config.packing_backend)
             return backend.unpack_bits(
@@ -1398,7 +1413,10 @@ class MaskStrategy(BaseCompressionStrategy):
             else:
                 indices = packed[:size]
             palette_arr = np.asarray(palette, dtype=dtype)
-            return palette_arr[indices].reshape(shape)
+            return cast(
+                np.ndarray[Any, np.dtype[Any]],
+                palette_arr[indices].reshape(shape),
+            )
 
         if path == "constant":
             value = self._deserialize_mask_value(metadata["value"])
@@ -1493,7 +1511,10 @@ class MaskStrategy(BaseCompressionStrategy):
         if not leading:
             return matrix
         broadcast_shape = leading + (size, size)
-        return np.broadcast_to(matrix, broadcast_shape).copy()
+        return cast(
+            np.ndarray[Any, np.dtype[Any]],
+            np.broadcast_to(matrix, broadcast_shape).copy(),
+        )
 
     def _encode_binary_mask(
         self,
@@ -1546,8 +1567,7 @@ class MaskStrategy(BaseCompressionStrategy):
             return None
 
         flat = np.asarray(tensor).reshape(-1)
-        palette = {float(value): index for index, value in enumerate(unique)}
-        indices = np.fromiter((palette[float(value)] for value in flat), dtype=np.uint8, count=flat.size)
+        indices = np.searchsorted(unique, flat).astype(np.uint8)
         packed = self._pack_2bit(indices).tobytes()
         packed_metadata = {
             self._COMPACT_LOSSLESS_FLAG: 1,

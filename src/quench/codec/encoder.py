@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import zlib
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 import numpy as np
 
@@ -13,10 +13,13 @@ from quench.core.config import QuenchConfig
 from quench.core.types import CodecMode, CompressedTensor, TensorHeader, TensorType
 from quench.quantize import ImportanceAllocator
 
+torch: Any
 try:  # pragma: no cover - torch is optional
-    import torch
+    import torch as _torch
 except Exception:  # pragma: no cover - torch is optional
     torch = None
+else:  # pragma: no cover - torch is optional
+    torch = _torch
 
 
 class QuenchEncoder:
@@ -124,7 +127,7 @@ class QuenchEncoder:
         if isinstance(tensor, np.ndarray):
             return np.asarray(tensor)
         if torch is not None and isinstance(tensor, torch.Tensor):
-            return tensor.detach().cpu().numpy()
+            return cast(np.ndarray[Any, np.dtype[Any]], tensor.detach().cpu().numpy())
         raise TypeError("Expected a numpy.ndarray or torch.Tensor input")
 
     def _should_force_lossless(
@@ -166,7 +169,7 @@ class QuenchEncoder:
     def _checksum(self, tensor: np.ndarray[Any, np.dtype[Any]]) -> int:
         """Compute a stable checksum from the original tensor bytes."""
         raw = np.ascontiguousarray(tensor).view(np.uint8)
-        return int(zlib.crc32(raw) & 0xFFFFFFFF)
+        return int(zlib.crc32(raw.tobytes()) & 0xFFFFFFFF)
 
     @staticmethod
     def _is_lossless_strategy_metadata(metadata: dict[str, Any]) -> bool:

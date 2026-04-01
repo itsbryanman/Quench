@@ -18,6 +18,24 @@ from quench.core.exceptions import (
 )
 from quench.core.types import CompressedTensor, TensorHeader
 
+_ALLOWED_DTYPES = frozenset(
+    {
+        "bool",
+        "uint8",
+        "int8",
+        "uint16",
+        "int16",
+        "uint32",
+        "int32",
+        "uint64",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+        "bfloat16",
+    }
+)
+
 
 class QuenchDecoder:
     """Decode :class:`CompressedTensor` objects back into numpy arrays."""
@@ -29,11 +47,14 @@ class QuenchDecoder:
         """Decode a single compressed tensor."""
         self._validate_compressed(compressed)
         header = compressed.header
+        if header.dtype not in _ALLOWED_DTYPES:
+            raise HeaderError(f"Disallowed dtype in tensor header: {header.dtype!r}")
+        dtype = np.dtype(header.dtype)
         metadata = deserialize_metadata(compressed.metadata)
         strategy_id, strategy_metadata = self._resolve_strategy_metadata(metadata, header)
         strategy = get_strategy_by_id(strategy_id, header.tensor_type)
         prepared_metadata = dict(strategy_metadata)
-        prepared_metadata.setdefault("_d", np.dtype(header.dtype).str)
+        prepared_metadata.setdefault("_d", dtype.str)
         prepared_metadata.setdefault("_s", [int(dim) for dim in header.shape])
 
         decoded = strategy.decode(compressed.payload, prepared_metadata, config=self._config)
@@ -46,11 +67,6 @@ class QuenchDecoder:
                 f"expected {expected_size}, got {restored.size}"
             )
 
-        try:
-            dtype = np.dtype(header.dtype)
-        except TypeError as exc:
-            raise HeaderError(f"Unsupported dtype in tensor header: {header.dtype!r}") from exc
-
         restored = restored.reshape(header.shape).astype(dtype, copy=False)
         expected_nbytes = expected_size * dtype.itemsize
         if compressed.original_nbytes != expected_nbytes:
@@ -60,7 +76,9 @@ class QuenchDecoder:
             )
 
         if self._is_lossless_metadata(prepared_metadata):
-            checksum = int(zlib.crc32(np.ascontiguousarray(restored).view(np.uint8)) & 0xFFFFFFFF)
+            checksum = int(
+                zlib.crc32(np.ascontiguousarray(restored).view(np.uint8).tobytes()) & 0xFFFFFFFF
+            )
             if checksum != header.checksum:
                 raise ChecksumMismatchError(
                     f"Checksum mismatch after lossless decode: expected {header.checksum}, got {checksum}"
